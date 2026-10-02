@@ -4,14 +4,18 @@
  * Section map:
  *   1. helpers + DTO mappers
  *   2. actors            /citizens, /verifiers, /trust-registry
+ *   2b. auth             /auth/* (citizen + verifier login)
  *   3. issuer portal     /issuer/*
- *   4. citizen wallet    /wallet/*
- *   5. verifier          /verifier/verify
+ *   4. citizen wallet    /wallet/*            (citizen login required)
+ *   5. verifier          /verifier/*          (verifier login required)
  *   6. revocation        /status-lists/:issuerId
  *   7. audit log         /audit, /audit/verify
  *
  * Design rules enforced here:
  *   - Private issuer keys never leave the database.
+ *   - Password hashes never leave the database.
+ *   - A session can only touch its OWN records (citizen A never sees B's
+ *     wallet; verifier X can never spend verifier Y's consent).
  *   - /verifier/verify returns ONLY the claims the citizen consented to share.
  *   - The audit log records claim *names*, never claim *values*.
  */
@@ -22,7 +26,18 @@ import { query, queryOne } from './db';
 import { appendAuditEvent, verifyAuditChain } from './audit';
 import { getStatusListRow, getStatusListView, allocateStatusIndex, isRevoked, revokeStatusIndex } from './statusList';
 import { claimKeys, claimsOf, createPresentation, indexCredential, issueSdJwt, verifyPresentation } from './sdjwt';
-import { importPrivateJwk } from './crypto';
+import { didKeyFromPublicJwk, didWeb, generateEd25519KeyPair, importPrivateJwk } from './crypto';
+import {
+  authValidation,
+  checkPassword,
+  getAuth,
+  hashPassword,
+  requireCitizen,
+  requireVerifier,
+  signToken,
+  verifyToken,
+  type AccountKind,
+} from './auth';
 import type {
   AuditLogRow,
   CheckResult,
@@ -158,10 +173,13 @@ function issuerEmptyJwk(): JWK {
 }
 
 function citizenDto(row: CitizenRow) {
+  // NOTE: password_hash is intentionally never included.
   return {
     id: row.id,
     name: row.name,
     did: row.did,
+    email: row.email,
+    hasLogin: row.password_hash !== null,
     createdAt: row.created_at.toISOString(),
   };
 }
@@ -179,7 +197,8 @@ function issuerDto(row: IssuerRow) {
 }
 
 function verifierDto(row: VerifierRow) {
-  return { id: row.id, name: row.name, did: row.did };
+  // NOTE: password_hash is intentionally never included.
+  return { id: row.id, name: row.name, did: row.did, email: row.email, hasLogin: row.password_hash !== null };
 }
 
 /** valid / revoked / expired, in that order of precedence. */
@@ -359,6 +378,160 @@ router.delete(
 );
 
 /* ------------------------------------------------------------------ */
+/* 2b. auth: citizen + verifier login                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Shared login logic for both account kinds. Registering a citizen also mints
+ * them a fresh did:key identity; registering a verifier mints a did:web.
+ * Every success returns { token, <citizen|verifier> } where the profile never
+ * contains the password hash.
+ */
+async function registerAccount(kind: AccountKind, body: Record<string, unknown>) {
+  const name = requireString(body, 'name', 200);
+  const email = authValidation.normalizeEmail(body.email);
+  const password = authValidation.checkPasswordRules(body.password);
+
+  if (kind === 'citizen') {
+    const clash = await queryOne<CitizenRow>('SELECT id FROM citizens WHERE email = $1', [email]);
+    if (clash) throw new HttpError(409, 'A citizen account with this email already exists. Try logging in.');
+    const keys = await generateEd25519KeyPair();
+    const did = didKeyFromPublicJwk(keys.publicJwk);
+    const created = await queryOne<CitizenRow>(
+      'INSERT INTO citizens (name, did, public_jwk, email, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [name, did, keys.publicJwk, email, await hashPassword(password)],
+    );
+    return created as CitizenRow;
+  }
+
+  const clash = await queryOne<VerifierRow>('SELECT id FROM verifiers WHERE email = $1', [email]);
+  if (clash) throw new HttpError(409, 'A verifier account with this email already exists. Try logging in.');
+  const domain = optionalString(body, 'domain', '').toLowerCase();
+  const safeDomain = domain === '' ? '' : domain.replace(/[^a-z0-9.-]/g, '');
+  if (domain !== '' && (safeDomain.length < 3 || safeDomain.length > 253)) {
+    throw new HttpError(400, '"domain" must be a valid hostname like "bank.example.com"');
+  }
+  // Random suffix keeps the did unique even when two verifiers pick one name.
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const finalDomain = safeDomain === '' ? `verifier-${suffix}.lifelink` : safeDomain;
+  const dupe = await queryOne<VerifierRow>('SELECT id FROM verifiers WHERE did = $1', [didWeb(finalDomain)]);
+  if (dupe) throw new HttpError(409, 'That domain is already taken by another verifier.');
+  const created = await queryOne<VerifierRow>(
+    'INSERT INTO verifiers (name, did, email, password_hash) VALUES ($1, $2, $3, $4) RETURNING *',
+    [name, didWeb(finalDomain), email, await hashPassword(password)],
+  );
+  return created as VerifierRow;
+}
+
+async function loginAccount(kind: AccountKind, body: Record<string, unknown>) {
+  const email = authValidation.normalizeEmail(body.email);
+  const password = authValidation.checkPasswordRules(body.password);
+
+  // Same generic message whether the email is unknown or the password is
+  // wrong: confirming "this email exists" would help account enumeration.
+  const invalid = new HttpError(401, 'Invalid email or password.');
+  if (kind === 'citizen') {
+    const row = await queryOne<CitizenRow>('SELECT * FROM citizens WHERE email = $1', [email]);
+    if (!row?.password_hash || !(await checkPassword(password, row.password_hash))) throw invalid;
+    return row;
+  }
+  const row = await queryOne<VerifierRow>('SELECT * FROM verifiers WHERE email = $1', [email]);
+  if (!row?.password_hash || !(await checkPassword(password, row.password_hash))) throw invalid;
+  return row;
+}
+
+function sessionResponse(kind: 'citizen', row: CitizenRow): { token: Promise<string>; profile: unknown };
+function sessionResponse(kind: 'verifier', row: VerifierRow): { token: Promise<string>; profile: unknown };
+function sessionResponse(kind: AccountKind, row: CitizenRow | VerifierRow) {
+  const email = row.email ?? '';
+  return {
+    token: signToken(kind, row.id, email),
+    profile: kind === 'citizen' ? citizenDto(row as CitizenRow) : verifierDto(row as VerifierRow),
+  };
+}
+
+router.post(
+  '/auth/citizen/register',
+  route(async (req, res) => {
+    const row = (await registerAccount('citizen', asRecord(req.body))) as CitizenRow;
+    const session = sessionResponse('citizen', row);
+    res.status(201).json({ token: await session.token, citizen: session.profile });
+  }),
+);
+
+router.post(
+  '/auth/citizen/login',
+  route(async (req, res) => {
+    const row = (await loginAccount('citizen', asRecord(req.body))) as CitizenRow;
+    const session = sessionResponse('citizen', row);
+    res.json({ token: await session.token, citizen: session.profile });
+  }),
+);
+
+router.post(
+  '/auth/verifier/register',
+  route(async (req, res) => {
+    const row = (await registerAccount('verifier', asRecord(req.body))) as VerifierRow;
+    const session = sessionResponse('verifier', row);
+    res.status(201).json({ token: await session.token, verifier: session.profile });
+  }),
+);
+
+router.post(
+  '/auth/verifier/login',
+  route(async (req, res) => {
+    const row = (await loginAccount('verifier', asRecord(req.body))) as VerifierRow;
+    const session = sessionResponse('verifier', row);
+    res.json({ token: await session.token, verifier: session.profile });
+  }),
+);
+
+/**
+ * Who am I? The frontend calls this on boot to validate a stored token and to
+ * learn the role + profile without a second round-trip.
+ */
+router.get(
+  '/auth/me',
+  route(async (req, res) => {
+    const header = req.headers.authorization ?? '';
+    const [scheme, token] = header.split(' ');
+    if (scheme !== 'Bearer' || !token) {
+      throw new HttpError(401, 'No session token. Please log in.');
+    }
+    // The role comes from the SIGNED token, so a citizen can never claim to
+    // be a verifier (or anyone else) by editing the request.
+    const auth = await verifyToken(token);
+    if (auth.kind === 'citizen') {
+      const row = await loadCitizen(auth.id);
+      res.json({ kind: 'citizen' as const, citizen: citizenDto(row) });
+      return;
+    }
+    const row = await loadVerifier(auth.id);
+    res.json({ kind: 'verifier' as const, verifier: verifierDto(row) });
+  }),
+);
+
+/**
+ * Ownership checks. The middleware (requireCitizen/requireVerifier) proves WHO
+ * is calling; these prove the caller only touches their OWN records. Without
+ * them, any logged-in citizen could read anyone else's wallet just by changing
+ * a query parameter.
+ */
+function requireSelfCitizen(req: Request, citizenId: number): void {
+  const auth = getAuth(req);
+  if (auth.kind !== 'citizen' || auth.id !== citizenId) {
+    throw new HttpError(403, 'You can only access your own wallet.');
+  }
+}
+
+function requireSelfVerifier(req: Request, verifierId: number): void {
+  const auth = getAuth(req);
+  if (auth.kind !== 'verifier' || auth.id !== verifierId) {
+    throw new HttpError(403, 'You can only act as your own verifier account.');
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 3. issuer portal                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -523,11 +696,13 @@ router.post(
 /** Everything in the citizen's wallet, with a friendly status per credential. */
 router.get(
   '/wallet/credentials',
+  requireCitizen,
   route(async (req, res) => {
     const citizenId = Number(req.query.citizenId);
     if (!Number.isInteger(citizenId) || citizenId <= 0) {
       throw new HttpError(400, 'Query parameter "citizenId" is required');
     }
+    requireSelfCitizen(req, citizenId);
     const citizen = await loadCitizen(citizenId);
 
     const result = await query<
@@ -583,9 +758,11 @@ router.get(
  */
 router.post(
   '/wallet/presentations',
+  requireCitizen,
   route(async (req, res) => {
     const body = asRecord(req.body);
     const citizenId = requireId(body, 'citizenId');
+    requireSelfCitizen(req, citizenId);
     const verifierId = requireId(body, 'verifierId');
     const credentialId = requireId(body, 'credentialId');
     const purpose = requireString(body, 'purpose', 300);
@@ -672,11 +849,13 @@ router.post(
 /** Sharing history: everything this citizen has ever agreed to share. */
 router.get(
   '/wallet/consents',
+  requireCitizen,
   route(async (req, res) => {
     const citizenId = Number(req.query.citizenId);
     if (!Number.isInteger(citizenId) || citizenId <= 0) {
       throw new HttpError(400, 'Query parameter "citizenId" is required');
     }
+    requireSelfCitizen(req, citizenId);
     const citizen = await loadCitizen(citizenId);
 
     const result = await query<ConsentRow & { verifier_name: string; verifier_did: string; credential_type: string }>(
@@ -696,6 +875,8 @@ router.get(
           id: row.verifier_id,
           name: row.verifier_name,
           did: row.verifier_did,
+          email: null,
+          password_hash: null,
         };
         const credential: CredentialRow = {
           id: row.credential_id,
@@ -717,10 +898,14 @@ router.get(
 /** End access early (DPDP: consent is as easy to withdraw as to give). */
 router.post(
   '/wallet/consents/:id/revoke',
+  requireCitizen,
   route(async (req, res) => {
     const id = idFromPath(req);
     const existing = await queryOne<ConsentRow>('SELECT * FROM consents WHERE id = $1', [id]);
     if (!existing) throw new HttpError(404, `Consent ${id} not found`);
+    // A citizen can only end their OWN consents — guessing another consent id
+    // must not work.
+    requireSelfCitizen(req, existing.citizen_id);
 
     const [verifier, credential] = await Promise.all([
       loadVerifier(existing.verifier_id),
@@ -761,6 +946,109 @@ router.post(
 );
 
 /* ------------------------------------------------------------------ */
+/* 4b. citizen: who verified my records?                               */
+/* ------------------------------------------------------------------ */
+
+interface VerificationRecord {
+  eventId: number;
+  result: 'granted' | 'denied';
+  verifier: { id: number; name: string; did: string };
+  credential: { id: number; type: string; typeLabel: string } | null;
+  consentId: number | null;
+  purpose: string | null;
+  revealedFields: string[];
+  deniedBecause: string[];
+  durationMs: number | null;
+  createdAt: string;
+}
+
+/**
+ * Turn VERIFICATION_* audit rows into a citizen/verifier-friendly history.
+ * The payload only ever stored field NAMES, so there is nothing sensitive to
+ * strip here — but the shape is still explicit rather than raw audit rows.
+ */
+function toVerificationRecord(
+  row: AuditLogRow & { verifier_name: string | null; verifier_did: string | null; credential_type: string | null },
+): VerificationRecord {
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = JSON.parse(row.payload) as Record<string, unknown>;
+  } catch {
+    /* keep defaults */
+  }
+  const asStrings = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+  return {
+    eventId: row.id,
+    result: row.event_type === 'VERIFICATION_GRANTED' ? 'granted' : 'denied',
+    verifier: {
+      id: row.verifier_id ?? 0,
+      name: row.verifier_name ?? 'Unknown verifier',
+      did: row.verifier_did ?? '',
+    },
+    credential:
+      row.credential_id === null
+        ? null
+        : {
+            id: row.credential_id,
+            type: typeof payload.credentialType === 'string' ? payload.credentialType : (row.credential_type ?? 'unknown'),
+            typeLabel: typeLabel(
+              typeof payload.credentialType === 'string' ? payload.credentialType : (row.credential_type ?? 'unknown'),
+            ),
+          },
+    consentId: typeof payload.consentId === 'number' ? payload.consentId : null,
+    purpose: typeof payload.purpose === 'string' ? payload.purpose : null,
+    revealedFields: asStrings(payload.revealedFields),
+    deniedBecause: asStrings(payload.deniedBecause),
+    durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+    createdAt: row.created_at.toISOString(),
+  };
+}
+
+/**
+ * "Which verifier checked what?" — every verification ever run against this
+ * citizen's credentials, newest first. This is the citizen's own view of the
+ * audit trail, so it needs nothing but their login.
+ */
+router.get(
+  '/wallet/verifications',
+  requireCitizen,
+  route(async (req, res) => {
+    const citizenId = Number(req.query.citizenId);
+    if (!Number.isInteger(citizenId) || citizenId <= 0) {
+      throw new HttpError(400, 'Query parameter "citizenId" is required');
+    }
+    requireSelfCitizen(req, citizenId);
+
+    const result = await query<
+      AuditLogRow & { verifier_name: string | null; verifier_did: string | null; credential_type: string | null }
+    >(
+      `SELECT a.*, v.name AS verifier_name, v.did AS verifier_did, c.type AS credential_type
+       FROM audit_log a
+       LEFT JOIN verifiers v ON v.id = a.verifier_id
+       LEFT JOIN credentials c ON c.id = a.credential_id
+       WHERE a.citizen_id = $1
+         AND a.event_type IN ('VERIFICATION_GRANTED', 'VERIFICATION_DENIED')
+       ORDER BY a.id DESC
+       LIMIT 100`,
+      [citizenId],
+    );
+
+    const records = result.rows.map(toVerificationRecord);
+    res.json({
+      citizenId,
+      verifications: records,
+      summary: {
+        total: records.length,
+        granted: records.filter((r) => r.result === 'granted').length,
+        denied: records.filter((r) => r.result === 'denied').length,
+        verifiers: new Set(records.map((r) => r.verifier.id)).size,
+      },
+    });
+  }),
+);
+
+/* ------------------------------------------------------------------ */
 /* 5. verifier                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -781,10 +1069,14 @@ router.post(
  */
 router.post(
   '/verifier/verify',
+  requireVerifier,
   route(async (req, res) => {
     const startedAt = Date.now();
     const body = asRecord(req.body);
     const verifierId = requireId(body, 'verifierId');
+    // A verifier session can only verify AS itself — never on behalf of
+    // another verifier account.
+    requireSelfVerifier(req, verifierId);
     const consentId = requireId(body, 'consentId');
     const presentation = requireString(body, 'presentation', 20_000);
 
@@ -954,6 +1246,59 @@ router.post(
         },
       },
       verifiedAt: new Date().toISOString(),
+    });
+  }),
+);
+
+/**
+ * The verifier's own profile: who they are, plus everything THEY have ever
+ * verified — which citizens, which credential types, and the outcomes.
+ * A verifier only ever sees their own profile.
+ */
+router.get(
+  '/verifier/profile',
+  requireVerifier,
+  route(async (req, res) => {
+    const auth = getAuth(req);
+    const verifier = await loadVerifier(auth.id);
+
+    const result = await query<
+      AuditLogRow & { citizen_name: string | null; credential_type: string | null }
+    >(
+      `SELECT a.*, p.name AS citizen_name, c.type AS credential_type
+       FROM audit_log a
+       LEFT JOIN citizens p ON p.id = a.citizen_id
+       LEFT JOIN credentials c ON c.id = a.credential_id
+       WHERE a.verifier_id = $1
+         AND a.event_type IN ('VERIFICATION_GRANTED', 'VERIFICATION_DENIED')
+       ORDER BY a.id DESC
+       LIMIT 100`,
+      [verifier.id],
+    );
+
+    const history = result.rows.map((row) => ({
+      ...toVerificationRecord({
+        ...row,
+        verifier_name: verifier.name,
+        verifier_did: verifier.did,
+      }),
+      citizen: {
+        id: row.citizen_id ?? 0,
+        name: row.citizen_name ?? 'Unknown citizen',
+      },
+    }));
+
+    const granted = history.filter((h) => h.result === 'granted').length;
+    res.json({
+      verifier: verifierDto(verifier),
+      stats: {
+        total: history.length,
+        granted,
+        denied: history.length - granted,
+        citizensServed: new Set(history.map((h) => h.citizen.id)).size,
+        credentialTypes: Array.from(new Set(history.map((h) => h.credential?.type ?? 'unknown'))),
+      },
+      history,
     });
   }),
 );

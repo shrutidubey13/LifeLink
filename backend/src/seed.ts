@@ -16,6 +16,7 @@
 import { applySchema, closePool, query, queryOne } from './db';
 import { didKeyFromPublicJwk, didWeb, generateEd25519KeyPair } from './crypto';
 import { INITIAL_BITS_BYTES } from './statusList';
+import { hashPassword } from './auth';
 import type { CitizenRow, IssuerRow, VerifierRow } from './types';
 
 const RESET = process.argv.includes('--reset');
@@ -137,6 +138,27 @@ async function main(): Promise<void> {
     verifiers.push(await seedVerifier(v.name, v.domain));
   }
 
+  // Demo logins. Same password everywhere so the demo never gets stuck at a
+  // login screen; real users register their own accounts through the UI.
+  const demoPasswordHash = await hashPassword('lifelink123');
+  await query('UPDATE citizens SET email = $1, password_hash = $2 WHERE id = $3', [
+    'student@demo.lifelink',
+    demoPasswordHash,
+    citizen.id,
+  ]);
+  const demoVerifierEmails: Record<string, string> = {
+    'Demo Bank': 'bank@demo.lifelink',
+    'Demo Employer HR': 'hr@demo.lifelink',
+  };
+  for (const verifier of verifiers) {
+    const email = demoVerifierEmails[verifier.name] ?? `verifier${verifier.id}@demo.lifelink`;
+    await query('UPDATE verifiers SET email = $1, password_hash = $2 WHERE id = $3', [
+      email,
+      demoPasswordHash,
+      verifier.id,
+    ]);
+  }
+
   // ------------------------------------------------------------------
   // Pretty summary — the frontend and README both expect these ids.
   // ------------------------------------------------------------------
@@ -160,6 +182,12 @@ async function main(): Promise<void> {
   for (const verifier of verifiers) {
     lines.push(`  ${String(verifier.id).padStart(2)}          ${verifier.name} — ${verifier.did}`);
   }
+  lines.push('');
+  lines.push('DEMO LOGINS  (password for all: lifelink123)');
+  lines.push('  citizen : student@demo.lifelink');
+  lines.push('  verifier: bank@demo.lifelink  (Demo Bank)');
+  lines.push('  verifier: hr@demo.lifelink    (Demo Employer HR)');
+  lines.push('  (or register a brand-new citizen / verifier from the login screen)');
   lines.push('');
   lines.push('QUICK CURL');
   lines.push(`  curl http://localhost:4000/wallet/credentials?citizenId=${citizen.id}`);

@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS verifiers (
   did TEXT NOT NULL UNIQUE
 );
 
+-- Login columns. Added with ALTER ... IF NOT EXISTS so the migration is safe
+-- to re-run on databases created before login existed (existing rows simply
+-- get NULL until the seed script or registration backfills them).
+ALTER TABLE citizens ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;
+ALTER TABLE citizens ADD COLUMN IF NOT EXISTS password_hash TEXT;
+ALTER TABLE verifiers ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;
+ALTER TABLE verifiers ADD COLUMN IF NOT EXISTS password_hash TEXT;
+
 -- consents: revoked column is a small documented superset of the spec
 -- (spec listed no revoked flag; we expire early AND flag it so history is clear).
 CREATE TABLE IF NOT EXISTS consents (

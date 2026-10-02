@@ -11,6 +11,8 @@ export interface Citizen {
   id: number;
   name: string;
   did: string;
+  email: string | null;
+  hasLogin: boolean;
   createdAt: string;
 }
 
@@ -28,6 +30,8 @@ export interface Verifier {
   id: number;
   name: string;
   did: string;
+  email: string | null;
+  hasLogin: boolean;
 }
 
 export interface Credential {
@@ -173,4 +177,61 @@ export interface StatusList {
   nextIndex: number;
   revoked: { index: number; credentialId: number | null; type: string }[];
   updatedAt: string;
+}
+
+/* ---------------- auth ---------------- */
+
+export type AccountKind = 'citizen' | 'verifier';
+
+/** The logged-in user, as returned by /auth/me and login/register. */
+export interface SessionUser {
+  kind: AccountKind;
+  id: number;
+  name: string;
+  email: string | null;
+  did: string;
+}
+
+export interface CitizenSession {
+  token: string;
+  citizen: Citizen;
+}
+
+export interface VerifierSession {
+  token: string;
+  verifier: Verifier;
+}
+
+/* ---------------- verification history ---------------- */
+
+/** One verification run against a credential, from the audit trail. */
+export interface VerificationRecord {
+  eventId: number;
+  result: 'granted' | 'denied';
+  verifier: { id: number; name: string; did: string };
+  credential: { id: number; type: string; typeLabel: string } | null;
+  consentId: number | null;
+  purpose: string | null;
+  revealedFields: string[];
+  deniedBecause: string[];
+  durationMs: number | null;
+  createdAt: string;
+}
+
+export interface CitizenVerifications {
+  citizenId: number;
+  verifications: VerificationRecord[];
+  summary: { total: number; granted: number; denied: number; verifiers: number };
+}
+
+export interface VerifierProfile {
+  verifier: Verifier;
+  stats: {
+    total: number;
+    granted: number;
+    denied: number;
+    citizensServed: number;
+    credentialTypes: string[];
+  };
+  history: (VerificationRecord & { citizen: { id: number; name: string } })[];
 }

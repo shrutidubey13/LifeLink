@@ -29,6 +29,14 @@ export const config = {
    * student team never has to remember the psql command.
    */
   autoMigrate: (process.env.AUTO_MIGRATE ?? 'true').toLowerCase() !== 'false',
+  /**
+   * Secret used to sign login session tokens (HS256). The default is fine for
+   * a local demo but MUST be replaced with a long random value in production —
+   * anyone holding it can mint sessions for any account.
+   */
+  authJwtSecret: process.env.AUTH_JWT_SECRET ?? 'dev-only-secret-change-me',
+  /** How long a login session lasts, in seconds (default: 12 hours). */
+  authTokenTtlSeconds: Number(process.env.AUTH_TOKEN_TTL_SECONDS ?? 12 * 60 * 60),
 };
 
 /**

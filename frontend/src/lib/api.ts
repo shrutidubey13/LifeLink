@@ -5,8 +5,11 @@
  * can show a real error state instead of "something went wrong".
  */
 import type {
+  AccountKind,
   AuditResponse,
   Citizen,
+  CitizenSession,
+  CitizenVerifications,
   ChainStatus,
   Consent,
   Credential,
@@ -15,11 +18,35 @@ import type {
   ShareResult,
   StatusList,
   Verifier,
+  VerifierProfile,
+  VerifierSession,
   VerifyResponse,
   WalletResponse,
 } from './types';
 
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000').replace(/\/$/, '');
+
+const TOKEN_KEY = 'lifelink_token';
+
+/** Fired when the server rejects our token — the session listens and logs out. */
+export const UNAUTHORIZED_EVENT = 'lifelink:unauthorized';
+
+export function getStoredToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function storeToken(token: string | null): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* private browsing etc. — the app still works for the session */
+  }
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -34,11 +61,16 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getStoredToken();
   let response: Response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
       ...init,
-      headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(init?.headers ?? {}),
+      },
     });
   } catch {
     throw new ApiError(
@@ -62,6 +94,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       body && typeof body === 'object' && 'error' in body
         ? String((body as { error: unknown }).error)
         : `Request failed with HTTP ${response.status}`;
+    // Our token was rejected: tell the session to log out everywhere at once.
+    if (response.status === 401 && getStoredToken()) {
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    }
     throw new ApiError(response.status, message, (body as { details?: unknown })?.details);
   }
   return body as T;
@@ -74,6 +110,17 @@ const del = <T>(path: string) => request<T>(path, { method: 'DELETE' });
 
 export const api = {
   health: () => get<{ status: string; time: string }>('/health'),
+
+  // auth
+  citizenLogin: (email: string, password: string) =>
+    post<CitizenSession>('/auth/citizen/login', { email, password }),
+  citizenRegister: (name: string, email: string, password: string) =>
+    post<CitizenSession>('/auth/citizen/register', { name, email, password }),
+  verifierLogin: (email: string, password: string) =>
+    post<VerifierSession>('/auth/verifier/login', { email, password }),
+  verifierRegister: (name: string, email: string, password: string) =>
+    post<VerifierSession>('/auth/verifier/register', { name, email, password }),
+  me: () => get<{ kind: AccountKind; citizen?: Citizen; verifier?: Verifier }>('/auth/me'),
 
   // actors + trust registry
   citizens: () => get<{ citizens: Citizen[] }>('/citizens'),
@@ -98,6 +145,8 @@ export const api = {
   // wallet
   wallet: (citizenId: number) => get<WalletResponse>(`/wallet/credentials?citizenId=${citizenId}`),
   consents: (citizenId: number) => get<{ citizen: Citizen; consents: Consent[] }>(`/wallet/consents?citizenId=${citizenId}`),
+  verifications: (citizenId: number) =>
+    get<CitizenVerifications>(`/wallet/verifications?citizenId=${citizenId}`),
   share: (input: {
     citizenId: number;
     verifierId: number;
@@ -111,6 +160,7 @@ export const api = {
   // verifier
   verify: (input: { verifierId: number; consentId: number; presentation: string }) =>
     post<VerifyResponse>('/verifier/verify', input),
+  verifierProfile: () => get<VerifierProfile>('/verifier/profile'),
 
   // revocation + audit
   statusList: (issuerId: number) => get<StatusList>(`/status-lists/${issuerId}`),

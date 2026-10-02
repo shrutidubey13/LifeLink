@@ -11,6 +11,10 @@ export interface CitizenRow {
   name: string;
   did: string;
   public_jwk: JWK;
+  /** Login email. NULL for rows created before login existed. */
+  email: string | null;
+  /** bcrypt hash. Never sent to any client — see publicCitizenDto. */
+  password_hash: string | null;
   created_at: Date;
 }
 
@@ -55,6 +59,10 @@ export interface VerifierRow {
   id: number;
   name: string;
   did: string;
+  /** Login email. NULL for rows created before login existed. */
+  email: string | null;
+  /** bcrypt hash. Never sent to any client — see publicVerifierDto. */
+  password_hash: string | null;
 }
 
 export interface ConsentRow {

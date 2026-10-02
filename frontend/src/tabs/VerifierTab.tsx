@@ -1,77 +1,108 @@
 /**
- * Tab 3 — the verifier portal.
+ * The verifier portal.
  *
- * Stands in for a bank or an employer HR system. It receives a presentation
- * plus the consent id, and the server answers with granted/denied, the checks
- * it ran, and ONLY the fields the citizen agreed to share.
+ * Stands in for a bank or an employer HR system. You act ONLY as your own
+ * logged-in account: the profile card shows what you have verified, and the
+ * verify form checks presentations citizens shared specifically with you.
  *
- * After sharing from the wallet, this tab is pre-filled automatically.
+ * After the citizen shares from the wallet (and you switch accounts), the form
+ * auto-fills from the stashed share — no retyping a 2KB presentation.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
+import { takeStashedShare } from '../lib/auth';
 import { fieldLabel, formatValue } from '../lib/catalog';
 import { formatDateTime, prettyJson } from '../lib/format';
 import { useAction, useRequest } from '../lib/hooks';
 import { decodePresentation } from '../lib/sdjwt';
-import type { CheckId, CheckResult, ShareResult, VerifyResponse, Verifier } from '../lib/types';
-import { Badge, Card, Field, InlineError, LoadingBlock, Select, Spinner } from '../components/ui';
+import type { CheckId, CheckResult, VerifyResponse } from '../lib/types';
+import { Badge, Card, DidTag, ErrorBlock, Field, InlineError, LoadingBlock, SectionTitle, Spinner } from '../components/ui';
 
 /** The four checks a relying party cares about, in the order the API runs them. */
 const HEADLINE: CheckId[] = ['issuer_trusted', 'signature_valid', 'not_revoked', 'consent_valid'];
 /** The disclosure-digest check is shown as a detail of the signature card. */
 const SUB_OF: Partial<Record<CheckId, CheckId>> = { disclosure_integrity: 'signature_valid' };
 
-export function VerifierTab({ pending, onConsumed }: { pending: ShareResult | null; onConsumed: () => void }) {
-  const verifiers = useRequest(() => api.verifiers(), 'verifiers');
-  const [verifierId, setVerifierId] = useState<number | ''>('');
+export function VerifierTab({ userId }: { userId: number }) {
+  const profile = useRequest(() => api.verifierProfile(), `verifier-profile-${userId}`);
   const [consentId, setConsentId] = useState('');
   const [presentation, setPresentation] = useState('');
   const [result, setResult] = useState<VerifyResponse | null>(null);
 
   const verify = useAction(api.verify);
 
-  // Auto-fill as soon as the wallet hands something over.
+  // Auto-fill from the wallet's stashed share (only when it was meant for us —
+  // a share for another verifier would just fail the consent check).
   useEffect(() => {
-    if (!pending) return;
-    setVerifierId(pending.verifier.id);
-    setConsentId(String(pending.consent.id));
-    setPresentation(pending.presentation);
-    setResult(null);
-    onConsumed();
-  }, [pending, onConsumed]);
+    const stashed = takeStashedShare();
+    if (stashed && stashed.verifierId === userId) {
+      setConsentId(String(stashed.consentId));
+      setPresentation(stashed.presentation);
+      setResult(null);
+    }
+  }, [userId]);
 
-  const verifierList: Verifier[] = verifiers.data?.verifiers ?? [];
   const preview = useMemo(() => (presentation ? decodePresentation(presentation) : null), [presentation]);
 
-  const canVerify = verifierId !== '' && consentId.trim() !== '' && presentation.trim() !== '';
+  const canVerify = consentId.trim() !== '' && presentation.trim() !== '';
 
   async function runVerify() {
     const response = await verify.run({
-      verifierId: Number(verifierId),
+      verifierId: userId,
       consentId: Number(consentId),
       presentation,
     });
     setResult(response);
+    if (response) profile.reload();
   }
 
   return (
     <div className="space-y-4">
-      {verifiers.loading && <LoadingBlock label="Loading verifiers…" />}
+      {profile.loading && <LoadingBlock label="Loading your profile…" />}
+      {profile.error && <ErrorBlock message={profile.error} onRetry={profile.reload} />}
+
+      {profile.data && (
+        <Card
+          title={`${profile.data.verifier.name} — verifier profile`}
+          subtitle="Your account, and everything you have verified."
+        >
+          <div className="flex flex-wrap items-center gap-1.5">
+            <DidTag did={profile.data.verifier.did} />
+            {profile.data.verifier.email && (
+              <span className="text-xs text-slate-500">{profile.data.verifier.email}</span>
+            )}
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <ProfileStat label="Verifications" value={profile.data.stats.total} />
+            <ProfileStat label="Granted" value={profile.data.stats.granted} />
+            <ProfileStat label="Denied" value={profile.data.stats.denied} />
+            <ProfileStat label="Citizens served" value={profile.data.stats.citizensServed} />
+          </div>
+          {profile.data.stats.credentialTypes.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              {profile.data.stats.credentialTypes.map((type) => (
+                <Badge key={type} tone="neutral">
+                  {type}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
 
       <Card
         title="Verify a citizen"
-        subtitle="No forms, no uploads. Paste (or auto-fill) the presentation the citizen shared."
+        subtitle="No forms, no uploads. Paste (or auto-fill) the presentation the citizen shared with you."
       >
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Verifier" htmlFor="verifier-pick">
-            <Select id="verifier-pick" value={verifierId} onChange={setVerifierId} disabled={verify.pending}>
-              <option value="">Choose a verifier…</option>
-              {verifierList.map((verifier) => (
-                <option key={verifier.id} value={verifier.id}>
-                  {verifier.name}
-                </option>
-              ))}
-            </Select>
+          <Field label="Verifying as" htmlFor="verifier-self">
+            <input
+              id="verifier-self"
+              className="input bg-slate-50"
+              value={profile.data?.verifier.name ?? '…'}
+              disabled
+              readOnly
+            />
           </Field>
 
           <Field label="Consent id" htmlFor="consent-id">
@@ -178,6 +209,70 @@ export function VerifierTab({ pending, onConsumed }: { pending: ShareResult | nu
       </Card>
 
       {result && <VerificationResult result={result} />}
+
+      <div>
+        <SectionTitle
+          hint={profile.data ? `${profile.data.history.length} total` : undefined}
+        >
+          What you have verified
+        </SectionTitle>
+        {profile.data && profile.data.history.length === 0 && (
+          <Card>
+            <p className="text-sm text-slate-600">
+              Nothing yet. When a citizen shares a record with you and you verify it, it appears here.
+            </p>
+          </Card>
+        )}
+        {profile.data && profile.data.history.length > 0 && (
+          <ul className="space-y-2">
+            {profile.data.history.map((entry) => (
+              <li
+                key={entry.eventId}
+                className={`rounded-xl border bg-white p-3 ${
+                  entry.result === 'granted' ? 'border-emerald-200' : 'border-rose-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-slate-900">
+                      {entry.citizen.name}
+                      <span className="font-normal text-slate-500">
+                        {' '}· {entry.credential?.typeLabel ?? 'credential'}
+                        {entry.consentId ? ` · consent #${entry.consentId}` : ''}
+                      </span>
+                    </p>
+                    {entry.purpose && <p className="mt-0.5 text-xs text-slate-600">“{entry.purpose}”</p>}
+                  </div>
+                  <Badge tone={entry.result === 'granted' ? 'granted' : 'denied'}>
+                    {entry.result === 'granted' ? '✓ Granted' : '✕ Denied'}
+                  </Badge>
+                </div>
+                {entry.result === 'granted' && entry.revealedFields.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {entry.revealedFields.map((field) => (
+                      <Badge key={field} tone="info">
+                        {fieldLabel(field)}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+                <p className="mt-2 text-[11px] text-slate-400">
+                  {formatDateTime(entry.createdAt)}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProfileStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-center">
+      <p className="text-xl font-bold leading-none text-slate-900">{value}</p>
+      <p className="mt-1 text-[11px] uppercase tracking-wide text-slate-500">{label}</p>
     </div>
   );
 }
