@@ -65,7 +65,20 @@ const healthSchema = z
   })
   .strict();
 
+const documentCredentialSchema = z
+  .object({
+    documentName: z.string().min(1).max(300),
+    category: z.string().max(100).optional(),
+    description: z.string().max(1000).optional(),
+    holderName: z.string().min(1).max(200),
+    issuedDate: z.string().min(1).max(50),
+    extraFields: z.record(z.string(), z.string()).optional(),
+    attachmentId: z.number().int().positive().optional(),
+  })
+  .strict();
+
 export const CREDENTIAL_SCHEMAS = {
+  DocumentCredential: documentCredentialSchema,
   DegreeCredential: degreeSchema,
   EmploymentCredential: employmentSchema,
   BankCustomerCredential: bankCustomerSchema,

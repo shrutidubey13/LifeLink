@@ -12,7 +12,7 @@ export const config = {
   /** Port the Express API listens on. */
   port,
   /** Postgres connection string. */
-  databaseUrl: process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/lifelink',
+  databaseUrl: process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/gitlink',
   /**
    * Maximum number of pooled Postgres clients. Lower it to 1 if you run
    * Postgres behind a single-session proxy (e.g. PGlite during testing).
@@ -25,16 +25,14 @@ export const config = {
    */
   appBaseUrl: process.env.APP_BASE_URL ?? `http://localhost:${port}`,
   /**
-   * When true, the server applies schema.sql on boot. Handy for a demo so a
-   * student team never has to remember the psql command.
+   * When true, the server applies schema.sql on boot.
    */
   autoMigrate: (process.env.AUTO_MIGRATE ?? 'true').toLowerCase() !== 'false',
   /**
-   * Secret used to sign login session tokens (HS256). The default is fine for
-   * a local demo but MUST be replaced with a long random value in production —
-   * anyone holding it can mint sessions for any account.
+   * Secret used to sign login session tokens (HS256). Must be replaced with
+   * a long random value in production — anyone holding it can mint sessions.
    */
-  authJwtSecret: process.env.AUTH_JWT_SECRET ?? 'dev-only-secret-change-me',
+  authJwtSecret: process.env.AUTH_JWT_SECRET ?? 'change-me-production-secret',
   /** How long a login session lasts, in seconds (default: 12 hours). */
   authTokenTtlSeconds: Number(process.env.AUTH_TOKEN_TTL_SECONDS ?? 12 * 60 * 60),
 };

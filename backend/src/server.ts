@@ -9,7 +9,7 @@
  *   - helmet security headers
  *   - strict CORS origin (one frontend origin, no credentials needed)
  *   - rate limits: tight on auth/token endpoints (brute-force protection),
- *     generous elsewhere so demos never trip it
+ *     generous elsewhere so traffic never trips it
  *   - 1MB JSON body cap (presentations are the largest payload)
  */
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -49,7 +49,7 @@ export function createApp() {
   });
   app.use(['/auth/', '/openid4vci/token'], authLimiter);
 
-  // General safety net (high enough to never trip during a demo).
+  // General safety net.
   const generalLimiter = rateLimit({
     windowMs: 60_000,
     limit: 600,
@@ -59,7 +59,7 @@ export function createApp() {
   });
   app.use(generalLimiter);
 
-  // Small request log — helpful while demoing. Never logs bodies, tokens,
+  // Small request log — helpful during development. Never logs bodies, tokens,
   // keys, or disclosures.
   app.use((req, res, next) => {
     const startedAt = Date.now();
@@ -125,7 +125,7 @@ async function main(): Promise<void> {
 
   const app = createApp();
   const server = app.listen(config.port, () => {
-    console.log(`LifeLink API listening on http://localhost:${config.port}`);
+    console.log(`GitLink API listening on http://localhost:${config.port}`);
     console.log(`Health check: http://localhost:${config.port}/health`);
   });
 

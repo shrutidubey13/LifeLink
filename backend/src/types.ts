@@ -59,6 +59,7 @@ export interface DocumentRequestRow {
   status: 'PENDING' | 'APPROVED' | 'REJECTED';
   rejection_reason: string | null;
   credential_id: number | null;
+  file_id: number | null;
   created_at: Date;
   reviewed_at: Date | null;
   reviewer: string | null;
@@ -97,9 +98,21 @@ export interface CredentialRow {
   /** W3C VC 2.0 representation (see vc.ts). NULL for legacy rows. */
   vc_json: unknown | null;
   status_index: number;
+  attachment_id: number | null;
   revoked: boolean;
   issued_at: Date;
   expires_at: Date;
+}
+
+export interface DocumentFileRow {
+  id: number;
+  owner: number;
+  file_name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  encrypted_bytes: Buffer;
+  created_at: Date;
 }
 
 export interface VerifierRow {
@@ -129,6 +142,7 @@ export interface ConsentRow {
   presentation_request_id: number | null;
   /** The SD-JWT+KB produced on approval (NULL until approved). */
   presentation: string | null;
+  share_attachment: boolean;
   expires_at: Date;
   /** True once the citizen has ended access early. */
   revoked: boolean;
@@ -171,6 +185,7 @@ export type AuditEventType =
   | 'CREDENTIAL_SHARED'
   | 'CREDENTIAL_VERIFIED'
   | 'VERIFICATION_FAILED'
+  | 'ATTACHMENT_VIEWED'
   | 'CREDENTIAL_REVOKED'
   | 'TRUST_REGISTRY_UPDATED';
 

@@ -49,8 +49,14 @@ export function prettyJson(value: unknown): string {
   }
 }
 
-/** Turn an error into a message that is useful to a demo audience. */
+/** Turn an error into a user-friendly message. */
 export function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }

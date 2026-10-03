@@ -11,8 +11,8 @@
  *   - private keys are never logged, never returned from any API, never put
  *     into error messages (callers only receive `KeyLike` objects)
  *   - new keys are ALWAYS stored encrypted
- *   - legacy plaintext columns are still readable (with a loud warning) so old
- *     demo databases keep working — but nothing new is ever written that way
+ *   - legacy plaintext columns are still readable (with a loud warning) so existing
+ *     databases keep working — but nothing new is ever written that way
  *
  * Honest scope note: this is envelope encryption for a hackathon prototype,
  * not an HSM. Key rotation (new kid, dual-sign window) is future work — the
@@ -120,7 +120,7 @@ export async function getIssuerSigningKey(args: {
   throw new Error(`KeyStore: issuer #${args.issuerId} has no usable signing key`);
 }
 
-/** Load a citizen's (custodial demo-wallet) holder key for KB signing. */
+/** Load a student's (custodial wallet) holder key for KB signing. */
 export async function getHolderSigningKey(args: {
   citizenId: number;
   privateKeyEnc: unknown;
@@ -134,3 +134,32 @@ export async function getHolderSigningKey(args: {
   }
   return toKeyLike(decryptPrivateJwk(env));
 }
+
+/**
+ * Encrypt arbitrary file bytes with the server's AES-256-GCM key.
+ * Stores IV (12 bytes) + AuthTag (16 bytes) + Ciphertext.
+ */
+export function encryptFileBytes(buffer: Buffer): Buffer {
+  const iv = randomBytes(IV_BYTES);
+  const cipher = createCipheriv(ALG, encKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(buffer), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]);
+}
+
+/**
+ * Decrypt file bytes encrypted with `encryptFileBytes`.
+ * Throws if auth tag verification fails or length is too short.
+ */
+export function decryptFileBytes(payload: Buffer): Buffer {
+  if (payload.length < IV_BYTES + 16) {
+    throw new Error('KeyStore: file payload too short for AES-GCM envelope');
+  }
+  const iv = payload.subarray(0, IV_BYTES);
+  const tag = payload.subarray(IV_BYTES, IV_BYTES + 16);
+  const ciphertext = payload.subarray(IV_BYTES + 16);
+  const decipher = createDecipheriv(ALG, encKey(), iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+

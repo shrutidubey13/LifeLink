@@ -1,31 +1,51 @@
 /**
- * Citizen wallet — the sidebar design, wired to the real backend.
+ * Citizen wallet — the modern sidebar design, wired to the real backend.
  *
- * Every screen from the original mock-up is kept (dashboard, credentials,
- * credential details, add document → review → pending, sharing history,
- * audit log, settings, consent, result). What changed: nothing is hard-coded
- * any more. Data comes from the API:
- *
- *   wallet / credentials ........ GET  /wallet/credentials
- *   incoming sharing requests ... GET  /wallet/requests
- *   Allow / Deny ................ POST /wallet/requests/:id/approve | reject
- *   documents ................... GET/POST /wallet/documents
- *   eligible issuers ............ GET  /organizations?documentType=
- *   sharing history ............. GET  /wallet/consents, POST /wallet/consents/:id/revoke
- *   who verified me ............. GET  /wallet/verifications
- *   audit log + hash chain ...... GET  /wallet/audit
+ * All screens:
+ *   - Dashboard (overview, stats, pending requests, recent credentials, activity)
+ *   - Credentials (full list, stage badges, open documents)
+ *   - Credential details (claims, status list bit, selective disclosure preview)
+ *   - Add document (file validation: type, size <= 10MB, progress, preview)
+ *   - Document review & verification pending
+ *   - Sharing history (active & ended consents, verifications, confirm end dialog)
+ *   - Audit log (tamper-evident hash chain, event payloads)
+ *   - Settings (DID, API URL, logout)
+ *   - Consent & Result screens
  */
-import { useCallback, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useMemo, useState } from 'react';
+import {
+  LayoutDashboard,
+  Award,
+  History,
+  ShieldCheck,
+  Settings,
+  ArrowRight,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  UploadCloud,
+  FileText,
+  FileCheck2,
+  Trash2,
+  Share2,
+  Eye,
+  GraduationCap,
+  Briefcase,
+  Landmark,
+  Activity,
+  Plus,
+  RotateCcw,
+  Paperclip,
+} from 'lucide-react';
 import { API_BASE, api } from './lib/api';
 import { stashShare, useAuth } from './lib/auth';
 import {
-  DOCUMENT_TYPES,
   EVENT_STYLES,
   fieldLabel,
   formatValue,
   stageForType,
 } from './lib/catalog';
-import { formatDate, formatDateTime, prettyJson, relativeTime, shortHash } from './lib/format';
+import { formatDate, formatDateTime, relativeTime } from './lib/format';
 import { useAction, useRequest } from './lib/hooks';
 import type {
   Consent,
@@ -35,7 +55,28 @@ import type {
   ShareResult,
 } from './lib/types';
 import { ConsentModal } from './components/ConsentModal';
-import { ErrorBlock, InlineError, LoadingBlock, Spinner } from './components/ui';
+import { FileViewer } from './components/FileViewer';
+import { KeyValueDisplay } from './components/ClaimsEditor';
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  ConfirmDialog,
+  EmptyState,
+  ErrorBlock,
+  InlineError,
+  PageHeader,
+  SkeletonList,
+  StatusBadge,
+  TruncatedHash,
+  useToast,
+} from './components/ui';
+import { AppShell } from './components/AppShell';
+import { useTitle } from './lib/useTitle';
 
 type Screen =
   | 'dashboard'
@@ -52,15 +93,6 @@ type Screen =
 
 type NavId = 'dashboard' | 'credentials' | 'history' | 'audit' | 'settings';
 
-const NAV: { id: NavId; label: string }[] = [
-  { id: 'dashboard', label: '🏠 Dashboard' },
-  { id: 'credentials', label: '📜 My Credentials' },
-  { id: 'history', label: '📤 Sharing History' },
-  { id: 'audit', label: '🔐 Audit Log' },
-  { id: 'settings', label: '⚙️ Settings' },
-];
-
-/** Which sidebar item is highlighted for each screen. */
 function navFor(screen: Screen): NavId {
   switch (screen) {
     case 'credentials':
@@ -77,9 +109,34 @@ function navFor(screen: Screen): NavId {
   }
 }
 
-const BTN_PRIMARY =
-  'bg-blue-700 text-white px-6 py-3 rounded-xl hover:bg-blue-800 transition disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500';
-const INPUT = 'w-full mt-2 border border-slate-300 rounded-xl px-4 py-3 bg-white';
+function screenTitle(screen: Screen): string {
+  switch (screen) {
+    case 'dashboard':
+      return 'Dashboard';
+    case 'credentials':
+      return 'My Credentials';
+    case 'credential':
+      return 'Credential Details';
+    case 'history':
+      return 'Sharing History';
+    case 'audit':
+      return 'Audit Log';
+    case 'settings':
+      return 'Settings';
+    case 'addDocument':
+      return 'Add Document';
+    case 'documentReview':
+      return 'Review Document';
+    case 'verificationPending':
+      return 'Verification Pending';
+    case 'consent':
+      return 'Review & Share';
+    case 'result':
+      return 'Presentation Shared';
+    default:
+      return 'Citizen Wallet';
+  }
+}
 
 function greeting(): string {
   const hour = new Date().getHours();
@@ -88,17 +145,12 @@ function greeting(): string {
   return 'Good evening';
 }
 
-function initialsId(did: string): string {
-  return did.length > 22 ? `${did.slice(0, 14)}…${did.slice(-6)}` : did;
-}
-
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** SHA-256 of the chosen file, so the backend stores a fingerprint of the document. */
 async function sha256Hex(file: File): Promise<string> {
   if (!globalThis.crypto?.subtle) return 'unavailable';
   const digest = await globalThis.crypto.subtle.digest('SHA-256', await file.arrayBuffer());
@@ -115,24 +167,43 @@ interface PickedFile {
 }
 
 interface DocDraft {
-  type: string;
+  documentName: string;
   organizationId: number | '';
   organizationName: string;
   purpose: string;
   file: PickedFile | null;
+  rawFile: File | null;
 }
 
 const EMPTY_DRAFT: DocDraft = {
-  type: DOCUMENT_TYPES[0].value,
+  documentName: '',
   organizationId: '',
   organizationName: '',
-  purpose: 'Credential Verification',
+  purpose: 'Document Verification',
   file: null,
+  rawFile: null,
 };
+
+function getStageIcon(type: string) {
+  const stage = stageForType(type);
+  switch (stage?.id) {
+    case 'education':
+      return <GraduationCap className="h-4 w-4 text-blue-600" />;
+    case 'employment':
+      return <Briefcase className="h-4 w-4 text-emerald-600" />;
+    case 'finance':
+      return <Landmark className="h-4 w-4 text-purple-600" />;
+    case 'healthcare':
+      return <Activity className="h-4 w-4 text-rose-600" />;
+    default:
+      return <FileText className="h-4 w-4 text-slate-500" />;
+  }
+}
 
 export function CitizenApp() {
   const { user, logout } = useAuth();
   const citizenId = user?.id ?? 0;
+  const { toast } = useToast();
 
   const [screen, setScreen] = useState<Screen>('dashboard');
   const [openCredentialId, setOpenCredentialId] = useState<number | null>(null);
@@ -142,9 +213,16 @@ export function CitizenApp() {
   const [lastShare, setLastShare] = useState<ShareResult | null>(null);
   const [sharing, setSharing] = useState<Credential | null>(null);
 
+  // Destructive confirm dialog states
+  const [consentToEnd, setConsentToEnd] = useState<Consent | null>(null);
+  const [requestToDeny, setRequestToDeny] = useState<PresentationRequest | null>(null);
+
   // Consent-screen choices
   const [pickedFields, setPickedFields] = useState<string[]>([]);
   const [pickedCredential, setPickedCredential] = useState<number | ''>('');
+  const [shareAttachment, setShareAttachment] = useState(false);
+
+  useTitle(screenTitle(screen));
 
   const wallet = useRequest(() => api.wallet(), `wallet-${citizenId}`);
   const incoming = useRequest(() => api.walletRequests(), `incoming-${citizenId}`);
@@ -181,11 +259,18 @@ export function CitizenApp() {
   const openCredential = credentials.find((c) => c.id === openCredentialId) ?? null;
 
   function openRequest(req: PresentationRequest) {
-    const matching = credentials.filter((c) => c.type === req.credentialType);
-    const firstValid = matching.find((c) => c.status === 'valid') ?? matching[0];
+    const matching = credentials.filter(
+      (c) =>
+        c.type === req.credentialType ||
+        (c.claims?.documentName && String(c.claims.documentName).toLowerCase() === req.credentialType.toLowerCase()) ||
+        req.credentialType === 'DocumentCredential' ||
+        req.credentialTypeLabel === c.typeLabel,
+    );
+    const firstValid = matching.find((c) => c.status === 'valid') ?? (credentials.find((c) => c.status === 'valid') ?? credentials[0]);
     setActiveRequestId(req.id);
     setPickedFields([...req.requestedFields]);
     setPickedCredential(firstValid?.id ?? '');
+    setShareAttachment(Boolean(firstValid?.attachmentId || firstValid?.attachment));
     approve.clearError();
     reject.clearError();
     setScreen('consent');
@@ -196,8 +281,10 @@ export function CitizenApp() {
     const result = await approve.run(activeRequest.id, {
       credentialId: Number(pickedCredential),
       fields: pickedFields,
+      shareAttachment,
     });
     if (result) {
+      toast.success('Presentation generated and shared with selective disclosure!');
       stashShare({ presentation: result.presentation });
       setLastShare(result);
       setActiveRequestId(null);
@@ -206,10 +293,12 @@ export function CitizenApp() {
     }
   }
 
-  async function handleDeny() {
-    if (!activeRequest) return;
-    const result = await reject.run(activeRequest.id);
+  async function confirmDenyAction() {
+    if (!requestToDeny) return;
+    const result = await reject.run(requestToDeny.id);
     if (result) {
+      toast.info('Sharing request denied. No claims were disclosed.');
+      setRequestToDeny(null);
       setActiveRequestId(null);
       reloadAll();
       setScreen('dashboard');
@@ -218,24 +307,33 @@ export function CitizenApp() {
 
   async function handleSubmitDocument() {
     if (!draft.file || draft.organizationId === '') return;
-    const result = await submitDoc.run({
-      documentType: draft.type,
-      documentName: draft.file.name,
-      documentRef: `sha256:${draft.file.hash}|name:${draft.file.name}|size:${draft.file.size}`,
-      mimeType: draft.file.mime || 'application/octet-stream',
-      organizationId: Number(draft.organizationId),
-      purpose: draft.purpose.trim(),
-    });
+    const formData = new FormData();
+    formData.append('documentName', draft.documentName.trim() || draft.file.name);
+    formData.append('organizationId', String(draft.organizationId));
+    formData.append('purpose', draft.purpose.trim());
+    if (draft.rawFile) {
+      formData.append('file', draft.rawFile);
+    }
+    formData.append('documentRef', `sha256:${draft.file.hash}|name:${draft.file.name}|size:${draft.file.size}`);
+    formData.append('mimeType', draft.file.mime || 'application/octet-stream');
+
+    const result = await submitDoc.run(formData);
     if (result) {
+      toast.success('Document submitted to organization for verification!');
       setSubmitMessage(result.message);
       reloadAll();
       setScreen('verificationPending');
     }
   }
 
-  async function handleEnd(consent: Consent) {
-    const result = await endConsent.run(consent.id);
-    if (result) reloadAll();
+  async function confirmEndConsentAction() {
+    if (!consentToEnd) return;
+    const result = await endConsent.run(consentToEnd.id);
+    if (result) {
+      toast.success('Sharing access ended. The verifier can no longer read this presentation.');
+      setConsentToEnd(null);
+      reloadAll();
+    }
   }
 
   const walletName = user?.name ?? 'Citizen';
@@ -243,182 +341,202 @@ export function CitizenApp() {
   const did = user?.did ?? '';
   const validCount = wallet.data?.summary.valid ?? 0;
 
+  const footerNotice = (
+    <p>
+      GitLink · W3C Verifiable Credentials (SD-JWT / Ed25519) · did:key &amp; did:web · W3C Bitstring
+      Status List · Hash-chained audit log · API at <code className="font-mono">{API_BASE}</code>
+    </p>
+  );
+
   return (
-    <div className="min-h-screen bg-slate-50 flex">
-      {/* SIDEBAR */}
-      <aside className="w-64 shrink-0 bg-white border-r border-slate-200 p-6 flex flex-col">
-        <div className="mb-10">
-          <h1 className="text-2xl font-bold text-blue-700">LifeLink</h1>
-          <p className="text-xs text-slate-400 mt-1">Digital Identity Wallet</p>
-        </div>
+    <AppShell
+      roleTitle="Student Wallet"
+      userName={walletName}
+      userIdentifier={did || `GL-${citizenId}`}
+      userRole="citizen"
+      onLogout={logout}
+      footerInfo={footerNotice}
+      navItems={[
+        {
+          id: 'dashboard',
+          label: 'Dashboard',
+          icon: <LayoutDashboard className="h-5 w-5" />,
+          badge: pendingRequests.length > 0 ? pendingRequests.length : undefined,
+          active: navFor(screen) === 'dashboard',
+          onClick: () => setScreen('dashboard'),
+        },
+        {
+          id: 'credentials',
+          label: 'My Credentials',
+          icon: <Award className="h-5 w-5" />,
+          badge: credentials.length > 0 ? credentials.length : undefined,
+          active: navFor(screen) === 'credentials',
+          onClick: () => setScreen('credentials'),
+        },
+        {
+          id: 'history',
+          label: 'Sharing History',
+          icon: <History className="h-5 w-5" />,
+          active: navFor(screen) === 'history',
+          onClick: () => setScreen('history'),
+        },
+        {
+          id: 'audit',
+          label: 'Audit Log',
+          icon: <ShieldCheck className="h-5 w-5" />,
+          active: navFor(screen) === 'audit',
+          onClick: () => setScreen('audit'),
+        },
+        {
+          id: 'settings',
+          label: 'Settings',
+          icon: <Settings className="h-5 w-5" />,
+          active: navFor(screen) === 'settings',
+          onClick: () => setScreen('settings'),
+        },
+      ]}
+    >
+      {/* Loading state for initial wallet fetch */}
+      {wallet.loading && !wallet.data && <SkeletonList count={3} />}
+      {wallet.error && <ErrorBlock message={wallet.error} onRetry={wallet.reload} />}
 
-        <nav className="space-y-2">
-          {NAV.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setScreen(item.id)}
-              className={
-                navFor(screen) === item.id
-                  ? 'w-full text-left px-4 py-3 rounded-xl bg-blue-50 text-blue-700 font-semibold'
-                  : 'w-full text-left px-4 py-3 rounded-xl text-slate-600 hover:bg-slate-50'
-              }
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
+      {wallet.data && screen === 'dashboard' && (
+        <Dashboard
+          firstName={firstName}
+          walletName={walletName}
+          did={did}
+          credentials={credentials}
+          validCount={validCount}
+          pendingRequests={pendingRequests}
+          auditError={audit.error}
+          recent={audit.data?.entries.slice(0, 5) ?? []}
+          onReview={openRequest}
+          onAddDocument={() => {
+            setDraft(EMPTY_DRAFT);
+            submitDoc.clearError();
+            setScreen('addDocument');
+          }}
+          onViewAll={() => setScreen('credentials')}
+          onOpenCredential={(id) => {
+            setOpenCredentialId(id);
+            setScreen('credential');
+          }}
+        />
+      )}
 
-        <div className="mt-12 bg-slate-50 rounded-xl p-4">
-          <p className="text-xs text-slate-500">WALLET STATUS</p>
-          <p className="text-sm font-semibold text-green-600 mt-2">● Active</p>
-          <p className="text-xs text-slate-400 mt-2 break-all font-mono">{initialsId(did) || `LL-${citizenId}`}</p>
-        </div>
+      {wallet.data && screen === 'credentials' && (
+        <CredentialsScreen
+          credentials={credentials}
+          openDocuments={openDocuments}
+          onOpen={(id) => {
+            setOpenCredentialId(id);
+            setScreen('credential');
+          }}
+          onAddDocument={() => {
+            setDraft(EMPTY_DRAFT);
+            submitDoc.clearError();
+            setScreen('addDocument');
+          }}
+        />
+      )}
 
-        <button
-          type="button"
-          onClick={logout}
-          className="mt-auto pt-6 text-left text-sm text-slate-500 hover:text-slate-800"
-        >
-          ⎋ Log out ({walletName})
-        </button>
-      </aside>
+      {wallet.data && screen === 'credential' && (
+        <CredentialDetail
+          credential={openCredential}
+          onBack={() => setScreen('credentials')}
+          onShare={(c) => setSharing(c)}
+        />
+      )}
 
-      {/* MAIN CONTENT */}
-      <main className="flex-1 p-10 min-w-0">
-        {wallet.loading && !wallet.data && <LoadingBlock label="Opening your wallet…" />}
-        {wallet.error && <ErrorBlock message={wallet.error} onRetry={wallet.reload} />}
+      {screen === 'addDocument' && (
+        <AddDocumentScreen
+          draft={draft}
+          setDraft={setDraft}
+          onBack={() => setScreen('dashboard')}
+          onContinue={() => setScreen('documentReview')}
+        />
+      )}
 
-        {wallet.data && screen === 'dashboard' && (
-          <Dashboard
-            firstName={firstName}
-            walletName={walletName}
-            did={did}
-            credentials={credentials}
-            validCount={validCount}
-            pendingRequests={pendingRequests}
-            auditError={audit.error}
-            recent={audit.data?.entries.slice(0, 5) ?? []}
-            onReview={openRequest}
-            onAddDocument={() => {
-              setDraft(EMPTY_DRAFT);
-              submitDoc.clearError();
-              setScreen('addDocument');
-            }}
-            onViewAll={() => setScreen('credentials')}
-            onOpenCredential={(id) => {
-              setOpenCredentialId(id);
-              setScreen('credential');
-            }}
-          />
-        )}
+      {screen === 'documentReview' && (
+        <DocumentReview
+          draft={draft}
+          pending={submitDoc.pending}
+          error={submitDoc.error}
+          onBack={() => setScreen('addDocument')}
+          onSubmit={() => void handleSubmitDocument()}
+        />
+      )}
 
-        {wallet.data && screen === 'credentials' && (
-          <CredentialsScreen
-            credentials={credentials}
-            openDocuments={openDocuments}
-            onOpen={(id) => {
-              setOpenCredentialId(id);
-              setScreen('credential');
-            }}
-          />
-        )}
+      {screen === 'verificationPending' && (
+        <VerificationPending
+          draft={draft}
+          message={submitMessage}
+          onDone={() => {
+            setDraft(EMPTY_DRAFT);
+            setScreen('credentials');
+          }}
+        />
+      )}
 
-        {wallet.data && screen === 'credential' && (
-          <CredentialDetail
-            credential={openCredential}
-            onBack={() => setScreen('credentials')}
-            onShare={(c) => setSharing(c)}
-          />
-        )}
+      {screen === 'history' && (
+        <HistoryScreen
+          consents={consents.data?.consents ?? []}
+          loading={consents.loading}
+          error={consents.error}
+          onRetry={consents.reload}
+          verifications={verifications.data?.verifications ?? []}
+          verificationSummary={verifications.data?.summary ?? null}
+          endError={endConsent.error}
+          ending={endConsent.pending}
+          onEnd={(c) => setConsentToEnd(c)}
+        />
+      )}
 
-        {screen === 'addDocument' && (
-          <AddDocumentScreen
-            draft={draft}
-            setDraft={setDraft}
-            onBack={() => setScreen('dashboard')}
-            onContinue={() => setScreen('documentReview')}
-          />
-        )}
+      {screen === 'audit' && (
+        <AuditScreen
+          loading={audit.loading}
+          error={audit.error}
+          onRetry={audit.reload}
+          data={audit.data}
+        />
+      )}
 
-        {screen === 'documentReview' && (
-          <DocumentReview
-            draft={draft}
-            pending={submitDoc.pending}
-            error={submitDoc.error}
-            onBack={() => setScreen('addDocument')}
-            onSubmit={() => void handleSubmitDocument()}
-          />
-        )}
+      {screen === 'settings' && (
+        <SettingsScreen
+          name={walletName}
+          email={user?.email ?? null}
+          did={did}
+          onLogout={logout}
+        />
+      )}
 
-        {screen === 'verificationPending' && (
-          <VerificationPending
-            draft={draft}
-            message={submitMessage}
-            onDone={() => {
-              setDraft(EMPTY_DRAFT);
-              setScreen('credentials');
-            }}
-          />
-        )}
+      {screen === 'consent' && (
+        <ConsentScreen
+          request={activeRequest}
+          credentials={credentials}
+          pickedFields={pickedFields}
+          setPickedFields={setPickedFields}
+          pickedCredential={pickedCredential}
+          setPickedCredential={setPickedCredential}
+          shareAttachment={shareAttachment}
+          setShareAttachment={setShareAttachment}
+          pending={approve.pending || reject.pending}
+          error={approve.error ?? reject.error}
+          onBack={() => setScreen('dashboard')}
+          onApprove={() => void handleApprove()}
+          onDeny={() => setRequestToDeny(activeRequest)}
+        />
+      )}
 
-        {screen === 'history' && (
-          <HistoryScreen
-            consents={consents.data?.consents ?? []}
-            loading={consents.loading}
-            error={consents.error}
-            onRetry={consents.reload}
-            verifications={verifications.data?.verifications ?? []}
-            verificationSummary={verifications.data?.summary ?? null}
-            endError={endConsent.error}
-            ending={endConsent.pending}
-            onEnd={(c) => void handleEnd(c)}
-          />
-        )}
+      {screen === 'result' && (
+        <ResultScreen
+          result={lastShare}
+          credential={credentials.find((c) => c.id === lastShare?.credential.id) ?? null}
+          onDone={() => setScreen('dashboard')}
+        />
+      )}
 
-        {screen === 'audit' && (
-          <AuditScreen
-            loading={audit.loading}
-            error={audit.error}
-            onRetry={audit.reload}
-            data={audit.data}
-          />
-        )}
-
-        {screen === 'settings' && (
-          <SettingsScreen
-            name={walletName}
-            email={user?.email ?? null}
-            did={did}
-            onLogout={logout}
-          />
-        )}
-
-        {screen === 'consent' && (
-          <ConsentScreen
-            request={activeRequest}
-            credentials={credentials}
-            pickedFields={pickedFields}
-            setPickedFields={setPickedFields}
-            pickedCredential={pickedCredential}
-            setPickedCredential={setPickedCredential}
-            pending={approve.pending || reject.pending}
-            error={approve.error ?? reject.error}
-            onBack={() => setScreen('dashboard')}
-            onApprove={() => void handleApprove()}
-            onDeny={() => void handleDeny()}
-          />
-        )}
-
-        {screen === 'result' && (
-          <ResultScreen
-            result={lastShare}
-            credential={credentials.find((c) => c.id === lastShare?.credential.id) ?? null}
-            onDone={() => setScreen('dashboard')}
-          />
-        )}
-      </main>
-
+      {/* Share / Consent Modal triggered from Credential Detail */}
       {sharing && (
         <ConsentModal
           credential={sharing}
@@ -433,43 +551,38 @@ export function CitizenApp() {
           }}
         />
       )}
-    </div>
+
+      {/* Confirm End Sharing Dialog */}
+      {consentToEnd && (
+        <ConfirmDialog
+          isOpen
+          title="End Sharing Session?"
+          description={`Are you sure you want to end sharing with ${
+            consentToEnd.verifier?.name ?? 'this organization'
+          }? Their cryptographic access to your credential will be revoked immediately.`}
+          confirmLabel="End Sharing"
+          tone="danger"
+          loading={endConsent.pending}
+          onClose={() => setConsentToEnd(null)}
+          onConfirm={confirmEndConsentAction}
+        />
+      )}
+
+      {/* Confirm Deny Request Dialog */}
+      {requestToDeny && (
+        <ConfirmDialog
+          isOpen
+          title="Deny Verification Request?"
+          description={`Are you sure you want to deny the request from ${requestToDeny.verifier.name}? They will not receive any disclosed claims.`}
+          confirmLabel="Deny Request"
+          tone="danger"
+          loading={reject.pending}
+          onClose={() => setRequestToDeny(null)}
+          onConfirm={confirmDenyAction}
+        />
+      )}
+    </AppShell>
   );
-}
-
-/* ------------------------------------------------------------------ */
-/* small shared pieces                                                 */
-/* ------------------------------------------------------------------ */
-
-function BackButton({ onClick, children }: { onClick: () => void; children: ReactNode }) {
-  return (
-    <button type="button" onClick={onClick} className="text-blue-600 mb-6">
-      {children}
-    </button>
-  );
-}
-
-function PageTitle({ title, subtitle }: { title: string; subtitle?: string }) {
-  return (
-    <div>
-      <h2 className="text-3xl font-bold text-slate-800">{title}</h2>
-      {subtitle && <p className="text-slate-500 mt-2">{subtitle}</p>}
-    </div>
-  );
-}
-
-function StatusPill({ status }: { status: Credential['status'] }) {
-  if (status === 'valid') return <span className="text-green-600 text-sm font-semibold">✓ Valid</span>;
-  if (status === 'revoked') return <span className="text-rose-600 text-sm font-semibold">✕ Revoked</span>;
-  return <span className="text-amber-600 text-sm font-semibold">⏱ Expired</span>;
-}
-
-function credentialIcon(type: string): string {
-  return stageForType(type)?.icon ?? '📄';
-}
-
-function stageName(type: string): string {
-  return (stageForType(type)?.label ?? 'Credential').toUpperCase();
 }
 
 /* ------------------------------------------------------------------ */
@@ -504,260 +617,391 @@ function Dashboard({
   onOpenCredential: (id: number) => void;
 }) {
   return (
-    <>
+    <div className="space-y-6 sm:space-y-8">
+      {/* Greeting Header */}
       <div>
-        <p className="text-sm text-blue-600 font-semibold">YOUR DIGITAL IDENTITY</p>
-        <h2 className="text-3xl font-bold text-slate-800 mt-2">
-          {greeting()}, {firstName} 👋
-        </h2>
-        <p className="text-slate-500 mt-2">Manage and securely share your verified credentials.</p>
+        <p className="text-xs font-bold uppercase tracking-wider text-blue-600">
+          Citizen Identity Wallet
+        </p>
+        <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-slate-900 mt-1">
+          {greeting()}, {firstName}
+        </h1>
+        <p className="text-sm text-slate-500 mt-1">
+          Manage, store, and selectively disclose your verified life records.
+        </p>
       </div>
 
-      {/* WALLET CARD */}
-      <div className="mt-8 bg-gradient-to-r from-blue-700 to-indigo-700 text-white rounded-3xl p-7 shadow-lg">
-        <div className="flex justify-between items-start">
-          <div className="min-w-0">
-            <p className="text-blue-200 text-sm">LIFELINK WALLET</p>
-            <h3 className="text-2xl font-bold mt-3">{walletName}</h3>
-            <p className="text-blue-200 mt-1 font-mono text-sm break-all">{initialsId(did)}</p>
-          </div>
-          <div className="bg-white/15 px-4 py-2 rounded-full">
-            <span className="text-sm">● Active</span>
+      {/* Wallet Identity Card */}
+      <div className="rounded-3xl bg-gradient-to-br from-blue-700 via-blue-800 to-indigo-900 p-6 sm:p-8 text-white shadow-xl relative overflow-hidden">
+        <div className="absolute -top-12 -right-12 w-48 h-48 rounded-full bg-blue-500/20 blur-2xl pointer-events-none" />
+
+        <div className="relative z-10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-blue-200">
+                GitLink Decentralized Identity
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 border border-emerald-400/30">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Active
+              </span>
+            </div>
+            <h2 className="text-2xl sm:text-3xl font-bold text-white mt-2">{walletName}</h2>
+            <div className="mt-2">
+              <TruncatedHash value={did} start={14} end={8} />
+            </div>
           </div>
         </div>
 
-        <div className="border-t border-white/20 mt-7 pt-5 flex justify-between">
+        <div className="relative z-10 mt-6 pt-6 border-t border-white/15 grid grid-cols-3 gap-3 text-center sm:text-left">
           <div>
-            <p className="text-blue-200 text-xs">VERIFIED CREDENTIALS</p>
-            <p className="text-xl font-bold mt-1">{validCount}</p>
-          </div>
-          <div>
-            <p className="text-blue-200 text-xs">SHARING REQUESTS</p>
-            <p className="text-xl font-bold mt-1">{pendingRequests.length}</p>
+            <p className="text-[11px] font-medium uppercase tracking-wider text-blue-200">
+              Verified Credentials
+            </p>
+            <p className="text-2xl font-bold text-white mt-1">{validCount}</p>
           </div>
           <div>
-            <p className="text-blue-200 text-xs">IDENTITY STATUS</p>
-            <p className="text-xl font-bold mt-1">{validCount > 0 ? 'Verified' : 'Not verified yet'}</p>
+            <p className="text-[11px] font-medium uppercase tracking-wider text-blue-200">
+              Pending Requests
+            </p>
+            <p className="text-2xl font-bold text-white mt-1">{pendingRequests.length}</p>
           </div>
-        </div>
-      </div>
-
-      {/* VERIFICATION REQUESTS */}
-      {pendingRequests.map((req) => (
-        <div key={req.id} className="mt-8 bg-white border border-blue-200 rounded-2xl p-6 shadow-sm">
-          <div className="flex justify-between items-start gap-4">
-            <div>
-              <p className="text-xs font-bold text-blue-600">ACTION REQUIRED</p>
-              <h3 className="text-xl font-bold text-slate-800 mt-2">
-                {req.verifier.name} wants to verify your {req.credentialTypeLabel}
-              </h3>
-              <p className="text-slate-500 mt-2">
-                Purpose: “{req.purpose}”. They are requesting only the information needed.
-              </p>
-            </div>
-            <div className="bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-xs font-semibold shrink-0">
-              Pending
-            </div>
-          </div>
-
-          <div className="mt-5 bg-slate-50 rounded-xl p-4">
-            <p className="text-xs text-slate-500">REQUESTED FIELDS</p>
-            <div className="mt-1 space-y-1">
-              {req.requestedFields.map((f) => (
-                <p key={f} className="font-semibold text-slate-800">
-                  ✓ {fieldLabel(f)}
-                </p>
-              ))}
-            </div>
-            <p className="text-xs text-slate-400 mt-3">Expires {relativeTime(req.expiresAt)}</p>
-          </div>
-
-          <button type="button" onClick={() => onReview(req)} className={`mt-5 ${BTN_PRIMARY}`}>
-            Review Request →
-          </button>
-        </div>
-      ))}
-
-      {/* ADD DOCUMENT */}
-      <div className="mt-8 bg-white border border-dashed border-blue-300 rounded-2xl p-6">
-        <div className="flex justify-between items-center gap-4">
           <div>
-            <p className="text-xs font-bold text-blue-600">NEW DOCUMENT</p>
-            <h3 className="text-xl font-bold text-slate-800 mt-2">Add a document to LifeLink</h3>
-            <p className="text-slate-500 mt-2">
-              Upload a document that you want to verify and store in your digital wallet.
+            <p className="text-[11px] font-medium uppercase tracking-wider text-blue-200">
+              Identity Status
+            </p>
+            <p className="text-base sm:text-xl font-bold text-emerald-300 mt-1">
+              {validCount > 0 ? 'Verified' : 'Initial'}
             </p>
           </div>
-          <button type="button" onClick={onAddDocument} className={`${BTN_PRIMARY} shrink-0`}>
-            + Add Document
-          </button>
         </div>
       </div>
 
-      {/* CREDENTIALS */}
-      <div className="flex justify-between items-center mt-10 mb-4">
-        <h3 className="text-xl font-bold text-slate-800">Your Credentials</h3>
-        <button type="button" onClick={onViewAll} className="text-blue-600 text-sm font-semibold">
-          View all →
-        </button>
-      </div>
+      {/* Action Required: Incoming Sharing Requests */}
+      {pendingRequests.length > 0 && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+              <Clock className="h-5 w-5 text-amber-500" />
+              <span>Pending Sharing Requests</span>
+            </h2>
+            <Badge tone="pending">{pendingRequests.length} Action Required</Badge>
+          </div>
 
-      {credentials.length === 0 ? (
-        <div className="bg-white rounded-2xl p-6 border border-slate-100 shadow-sm text-slate-500">
-          Your wallet is empty. Add a document above, or ask your university or employer to issue a
-          credential directly.
-        </div>
-      ) : (
-        <div className="grid grid-cols-2 gap-5">
-          {credentials.slice(0, 4).map((c) => (
-            <CredentialTile key={c.id} credential={c} onOpen={() => onOpenCredential(c.id)} />
-          ))}
+          <div className="space-y-3">
+            {pendingRequests.map((req) => (
+              <Card key={req.id} className="border-amber-200 bg-amber-50/20 p-5">
+                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-bold text-slate-900">
+                        {req.verifier.name}
+                      </span>
+                      <Badge tone="info">{req.credentialTypeLabel}</Badge>
+                      <Badge tone="pending">Pending Consent</Badge>
+                    </div>
+                    <p className="text-xs text-slate-600">
+                      Purpose: “{req.purpose}” · Request expires {relativeTime(req.expiresAt)}
+                    </p>
+                    <div className="mt-3 rounded-xl bg-white p-3 border border-slate-200/80">
+                      <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                        Requested Claims
+                      </p>
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {req.requestedFields.map((f) => (
+                          <Badge key={f} tone="info">
+                            ✓ {fieldLabel(f)}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="shrink-0 pt-2 sm:pt-0">
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      iconRight={<ArrowRight className="h-4 w-4" />}
+                      onClick={() => onReview(req)}
+                    >
+                      Review &amp; Share
+                    </Button>
+                  </div>
+                </div>
+              </Card>
+            ))}
+          </div>
         </div>
       )}
 
-      {/* RECENT ACTIVITY */}
-      <h3 className="text-xl font-bold text-slate-800 mt-10 mb-4">Recent Activity</h3>
-      <div className="bg-white rounded-2xl border border-slate-100 shadow-sm">
-        {auditError && <p className="p-5 text-sm text-rose-600">{auditError}</p>}
-        {!auditError && recent.length === 0 && (
-          <p className="p-5 text-sm text-slate-500">No activity yet.</p>
-        )}
-        {recent.map((entry, index) => {
-          const style = EVENT_STYLES[entry.eventType];
-          return (
-            <div
-              key={entry.id}
-              className={`p-5 flex items-center gap-4 ${index < recent.length - 1 ? 'border-b' : ''}`}
-            >
-              <div className="bg-blue-100 text-blue-600 rounded-full w-9 h-9 flex items-center justify-center">
-                •
-              </div>
-              <p className="font-semibold">{style?.label ?? entry.eventType}</p>
-              <p className="ml-auto text-xs text-slate-400">{relativeTime(entry.createdAt)}</p>
-            </div>
-          );
-        })}
+      {/* Add Document Banner */}
+      <div className="rounded-2xl border border-dashed border-blue-300 bg-blue-50/40 p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <span className="text-[11px] font-bold uppercase tracking-wider text-blue-700">
+            Submit Document
+          </span>
+          <h3 className="text-lg font-bold text-slate-900 mt-0.5">
+            Add a document for official verification
+          </h3>
+          <p className="text-xs text-slate-600 mt-1 max-w-xl">
+            Upload your degree certificate, employment contract, or bank KYC document. The issuing
+            organization verifies it and signs an official credential into your wallet.
+          </p>
+        </div>
+        <Button
+          variant="primary"
+          size="md"
+          icon={<Plus className="h-4 w-4" />}
+          onClick={onAddDocument}
+          className="shrink-0 self-start sm:self-center"
+        >
+          Add Document
+        </Button>
       </div>
-    </>
+
+      {/* Credentials Overview */}
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <Award className="h-5 w-5 text-blue-600" />
+            <span>Your Credentials</span>
+          </h2>
+          {credentials.length > 0 && (
+            <button
+              type="button"
+              onClick={onViewAll}
+              className="text-xs font-semibold text-blue-600 hover:text-blue-800 transition-colors"
+            >
+              View all ({credentials.length}) →
+            </button>
+          )}
+        </div>
+
+        {credentials.length === 0 ? (
+          <EmptyState
+            icon={<Award className="h-6 w-6" />}
+            title="Your wallet is empty"
+            description="You don't have any verified credentials yet. Submit a document to an eligible organization to get your first credential."
+            action={
+              <Button variant="secondary" size="sm" onClick={onAddDocument}>
+                Submit First Document
+              </Button>
+            }
+          />
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {credentials.slice(0, 4).map((c) => (
+              <CredentialTile
+                key={c.id}
+                credential={c}
+                onOpen={() => onOpenCredential(c.id)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Recent Activity */}
+      <div className="space-y-3">
+        <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+          <ShieldCheck className="h-5 w-5 text-blue-600" />
+          <span>Recent Activity</span>
+        </h2>
+
+        {auditError && <ErrorBlock message={auditError} />}
+        {!auditError && recent.length === 0 && (
+          <Card>
+            <p className="text-xs text-slate-500">No cryptographic activity recorded yet.</p>
+          </Card>
+        )}
+
+        {recent.length > 0 && (
+          <Card className="p-0 overflow-hidden divide-y divide-slate-100">
+            {recent.map((entry) => {
+              const style = EVENT_STYLES[entry.eventType];
+              return (
+                <div key={entry.id} className="p-3.5 sm:p-4 flex items-center gap-3">
+                  <div className="h-8 w-8 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+                    <CheckCircle2 className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-semibold text-slate-800 truncate">
+                      {style?.label ?? entry.eventType}
+                    </p>
+                    <p className="text-[10px] text-slate-400 font-mono">
+                      Event #{entry.id}
+                    </p>
+                  </div>
+                  <span className="text-xs text-slate-400 shrink-0">
+                    {relativeTime(entry.createdAt)}
+                  </span>
+                </div>
+              );
+            })}
+          </Card>
+        )}
+      </div>
+    </div>
   );
 }
 
-function CredentialTile({ credential, onOpen }: { credential: Credential; onOpen: () => void }) {
+function CredentialTile({
+  credential,
+  onOpen,
+}: {
+  credential: Credential;
+  onOpen: () => void;
+}) {
   return (
-    <button
-      type="button"
+    <Card
+      className="cursor-pointer hover:border-blue-400 hover:shadow-md transition-all p-5 flex flex-col justify-between"
       onClick={onOpen}
-      className="text-left bg-white rounded-2xl p-6 border border-slate-100 shadow-sm hover:border-blue-400 hover:shadow-md transition"
     >
-      <div className="flex justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-xs text-slate-500">{stageName(credential.type)}</p>
-          <h4 className="text-lg font-bold mt-2">
-            {credentialIcon(credential.type)} {credential.typeLabel}
-          </h4>
-          <p className="text-slate-500 mt-1">{credential.issuer.name}</p>
+      <div>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <div className="p-2 rounded-xl bg-slate-100 text-slate-700">
+              {getStageIcon(credential.type)}
+            </div>
+            <div>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                {stageForType(credential.type)?.label ?? 'Credential'}
+              </span>
+              <h3 className="text-base font-bold text-slate-900 leading-snug">
+                {credential.typeLabel}
+              </h3>
+            </div>
+          </div>
+          <StatusBadge status={credential.status} />
         </div>
-        <StatusPill status={credential.status} />
+        <p className="text-xs text-slate-500 mt-3">
+          Issuer: <strong className="text-slate-700">{credential.issuer.name}</strong>
+        </p>
       </div>
-      <div className="border-t mt-5 pt-4 flex justify-between">
-        <div>
-          <p className="text-xs text-slate-400">Issued</p>
-          <p className="text-sm font-medium mt-1">{formatDate(credential.issuedAt)}</p>
-        </div>
-        <p className="text-blue-600 text-sm font-semibold self-end">View Credential →</p>
+
+      <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
+        <span className="text-slate-400 font-medium">Issued {formatDate(credential.issuedAt)}</span>
+        <span className="text-blue-600 font-semibold inline-flex items-center gap-1">
+          <span>View Details</span>
+          <ArrowRight className="h-3 w-3" />
+        </span>
       </div>
-    </button>
+    </Card>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* credentials                                                         */
+/* credentials list                                                   */
 /* ------------------------------------------------------------------ */
 
 function CredentialsScreen({
   credentials,
   openDocuments,
   onOpen,
+  onAddDocument,
 }: {
   credentials: Credential[];
   openDocuments: DocumentRequest[];
   onOpen: (id: number) => void;
+  onAddDocument: () => void;
 }) {
   return (
-    <div>
-      <PageTitle title="My Credentials" subtitle="All credentials stored in your LifeLink wallet." />
+    <div className="space-y-6">
+      <PageHeader
+        title="My Credentials"
+        subtitle="All verifiable credentials cryptographically stored in your GitLink wallet."
+        badge={<Badge tone="neutral">{credentials.length} Total</Badge>}
+        actions={
+          <Button
+            variant="primary"
+            size="sm"
+            icon={<Plus className="h-4 w-4" />}
+            onClick={onAddDocument}
+          >
+            Add Document
+          </Button>
+        }
+      />
 
       {credentials.length === 0 && openDocuments.length === 0 && (
-        <div className="bg-white rounded-2xl p-6 mt-8 shadow-sm border text-slate-500">
-          Nothing here yet. Add a document from the dashboard to get started.
+        <EmptyState
+          icon={<Award className="h-6 w-6" />}
+          title="No credentials or documents"
+          description="Your wallet is currently empty. Submit a document to an issuing organization to get started."
+          action={
+            <Button variant="primary" size="sm" onClick={onAddDocument}>
+              Submit Document
+            </Button>
+          }
+        />
+      )}
+
+      {/* Verified Credentials */}
+      {credentials.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {credentials.map((c) => (
+            <CredentialTile key={c.id} credential={c} onOpen={() => onOpen(c.id)} />
+          ))}
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-5 mt-8">
-        {credentials.map((c) => (
-          <button
-            key={c.id}
-            type="button"
-            onClick={() => onOpen(c.id)}
-            className="text-left bg-white rounded-2xl p-6 shadow-sm border hover:border-blue-400"
-          >
-            <p className="text-xs text-slate-500">{stageName(c.type)}</p>
-            <h3 className="text-xl font-bold mt-2">
-              {credentialIcon(c.type)} {c.typeLabel}
-            </h3>
-            <p className="text-slate-500">{c.issuer.name}</p>
-            <span
-              className={`inline-block mt-5 px-3 py-1 rounded-full text-sm ${
-                c.status === 'valid'
-                  ? 'bg-green-100 text-green-700'
-                  : c.status === 'revoked'
-                    ? 'bg-rose-100 text-rose-700'
-                    : 'bg-amber-100 text-amber-700'
-              }`}
-            >
-              {c.status === 'valid' ? '✓ Valid' : c.status === 'revoked' ? '✕ Revoked' : '⏱ Expired'}
-            </span>
-          </button>
-        ))}
+      {/* Submitted Documents Pending / Rejected */}
+      {openDocuments.length > 0 && (
+        <div className="space-y-3 pt-6 border-t border-slate-200">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <FileText className="h-5 w-5 text-blue-600" />
+            <span>Document Submissions ({openDocuments.length})</span>
+          </h2>
 
-        {openDocuments.map((d) => (
-          <div
-            key={`doc-${d.id}`}
-            className={`bg-white rounded-2xl p-6 shadow-sm border ${
-              d.status === 'REJECTED' ? 'border-rose-200' : 'border-blue-200'
-            }`}
-          >
-            <p
-              className={`text-xs font-semibold ${
-                d.status === 'REJECTED' ? 'text-rose-600' : 'text-blue-600'
-              }`}
-            >
-              {d.status === 'REJECTED' ? 'REJECTED DOCUMENT' : 'NEW DOCUMENT'}
-            </p>
-            <h3 className="text-xl font-bold mt-2">{d.documentType}</h3>
-            <p className="text-slate-500 mt-1">{d.organization?.name ?? `Organization #${d.organizationId}`}</p>
-            <p className="text-sm text-slate-400 mt-1 break-all">{d.documentName}</p>
-            {d.status === 'REJECTED' ? (
-              <>
-                <span className="inline-block mt-5 bg-rose-100 text-rose-700 px-3 py-1 rounded-full text-sm">
-                  ✕ Rejected
-                </span>
-                {d.rejectionReason && (
-                  <p className="text-sm text-rose-700 mt-2">Reason: {d.rejectionReason}</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {openDocuments.map((d) => (
+              <Card
+                key={`doc-${d.id}`}
+                className={
+                  d.status === 'REJECTED'
+                    ? 'border-rose-200 bg-rose-50/20'
+                    : 'border-amber-200 bg-amber-50/20'
+                }
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                      {d.documentType}
+                    </span>
+                    <h3 className="text-base font-bold text-slate-900 mt-0.5">
+                      {d.documentName}
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Submitted to {d.organization?.name ?? `Organization #${d.organizationId}`}
+                    </p>
+                  </div>
+                  <Badge tone={d.status === 'REJECTED' ? 'danger' : 'pending'}>
+                    {d.status === 'REJECTED' ? 'Rejected' : 'Pending Verification'}
+                  </Badge>
+                </div>
+
+                {d.status === 'REJECTED' && d.rejectionReason && (
+                  <div className="mt-3 rounded-lg bg-rose-50 p-2.5 text-xs text-rose-800 border border-rose-200">
+                    <strong>Rejection reason:</strong> {d.rejectionReason}
+                  </div>
                 )}
-              </>
-            ) : (
-              <span className="inline-block mt-5 bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-sm">
-                🟡 Pending Verification
-              </span>
-            )}
-            <p className="text-xs text-slate-400 mt-3">Submitted {formatDateTime(d.createdAt)}</p>
+
+                <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-400">
+                  <span>Submitted {formatDateTime(d.createdAt)}</span>
+                  <TruncatedHash value={d.documentRef} start={8} end={6} />
+                </div>
+              </Card>
+            ))}
           </div>
-        ))}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* credential details                                                 */
+/* ------------------------------------------------------------------ */
 
 function CredentialDetail({
   credential,
@@ -771,92 +1015,171 @@ function CredentialDetail({
   if (!credential) {
     return (
       <div>
-        <BackButton onClick={onBack}>← Back to Credentials</BackButton>
-        <p className="text-slate-500">That credential is no longer in your wallet.</p>
+        <PageHeader title="Credential Details" backButton={{ label: 'Back to Credentials', onClick: onBack }} />
+        <EmptyState title="Credential not found" description="That credential is no longer available in your wallet." />
       </div>
     );
   }
+
   return (
-    <div>
-      <BackButton onClick={onBack}>← Back to Credentials</BackButton>
-      <h2 className="text-3xl font-bold text-slate-800">Credential Details</h2>
+    <div className="space-y-6">
+      <PageHeader
+        title={credential.typeLabel}
+        subtitle={`Issued by ${credential.issuer.name}`}
+        backButton={{ label: 'Back to Credentials', onClick: onBack }}
+        badge={<StatusBadge status={credential.status} />}
+        actions={
+          credential.status === 'valid' ? (
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<Share2 className="h-4 w-4" />}
+              onClick={() => onShare(credential)}
+            >
+              Share with Verifier
+            </Button>
+          ) : undefined
+        }
+      />
 
-      <div className="bg-white rounded-2xl shadow-sm p-8 mt-6 max-w-2xl">
-        <div className="flex justify-between items-start gap-4">
-          <div>
-            <p className="text-sm text-slate-500">CREDENTIAL TYPE</p>
-            <h3 className="text-2xl font-bold mt-2">
-              {credentialIcon(credential.type)} {credential.typeLabel}
-            </h3>
-            <p className="text-slate-600 mt-1">Issued by {credential.issuer.name}</p>
-          </div>
-          <span
-            className={`px-4 py-2 rounded-full shrink-0 ${
-              credential.status === 'valid'
-                ? 'bg-green-100 text-green-700'
-                : credential.status === 'revoked'
-                  ? 'bg-rose-100 text-rose-700'
-                  : 'bg-amber-100 text-amber-700'
-            }`}
-          >
-            {credential.status === 'valid' ? '✓ Valid' : credential.status === 'revoked' ? '✕ Revoked' : '⏱ Expired'}
-          </span>
-        </div>
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Left: Metadata & Claims */}
+        <div className="lg:col-span-8 space-y-6">
+          {credential.attachment && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base flex items-center gap-2 text-slate-900">
+                  <FileText className="h-5 w-5 text-blue-600" />
+                  <span>Attached File: {credential.attachment.name}</span>
+                </CardTitle>
+                <CardDescription className="text-sm">
+                  {credential.attachment.mime} · {(credential.attachment.size / 1024).toFixed(1)} KB · Stored encrypted at rest with AES-256-GCM
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-96 rounded-xl border border-slate-200 overflow-hidden bg-slate-50">
+                  <FileViewer
+                    url={api.walletAttachmentUrl(credential.attachment.id)}
+                    fileName={credential.attachment.name}
+                    mimeType={credential.attachment.mime}
+                    fileSize={credential.attachment.size}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+          )}
 
-        <div className="border-t mt-8 pt-6 space-y-5">
-          <Detail label="Issued Date" value={formatDate(credential.issuedAt)} />
-          <Detail label="Expires" value={formatDate(credential.expiresAt)} />
-          <Detail label="Credential ID" value={`LL-CRED-${credential.id}`} />
-          <Detail label="Issuer" value={credential.issuer.name} />
-          <Detail label="Issuer DID" value={credential.issuer.did} mono />
-        </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Verified Claims</CardTitle>
+              <CardDescription>
+                Cryptographically bound data signed by {credential.issuer.name}.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <dl className="divide-y divide-slate-100">
+                {Object.entries(credential.claims).map(([key, value]) => (
+                  <div key={key} className="flex justify-between py-2.5 text-base">
+                    <dt className="text-slate-500 font-medium">{fieldLabel(key)}</dt>
+                    <dd className="font-semibold text-slate-900 break-all text-right">{formatValue(value)}</dd>
+                  </div>
+                ))}
+              </dl>
+            </CardContent>
+          </Card>
 
-        <div className="mt-8">
-          <p className="text-sm text-slate-500">Details in this credential</p>
-          <div className="mt-3 divide-y rounded-xl border">
-            {Object.entries(credential.claims).map(([key, value]) => (
-              <div key={key} className="flex justify-between gap-4 px-4 py-3 text-sm">
-                <span className="text-slate-500">{fieldLabel(key)}</span>
-                <span className="font-semibold text-slate-800 text-right break-all">{formatValue(value)}</span>
+          <Card>
+            <CardHeader>
+              <CardTitle>W3C Cryptographic Proof Details</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
+                <span className="text-slate-500 font-medium">Credential ID</span>
+                <span className="font-mono text-slate-800">GL-CRED-{credential.id}</span>
               </div>
-            ))}
-          </div>
+              {credential.attachment && (
+                <div className="flex justify-between py-1.5 border-b border-slate-100">
+                  <span className="text-slate-500 font-medium">Attached File</span>
+                  <span className="font-mono text-slate-800 text-xs">
+                    {credential.attachment.name} ({(credential.attachment.size / 1024).toFixed(1)} KB, {credential.attachment.mime})
+                  </span>
+                </div>
+              )}
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
+                <span className="text-slate-500 font-medium">Issued Date</span>
+                <span className="text-slate-800 font-medium">{formatDate(credential.issuedAt)}</span>
+              </div>
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
+                <span className="text-slate-500 font-medium">Expiration Date</span>
+                <span className="text-slate-800 font-medium">{formatDate(credential.expiresAt)}</span>
+              </div>
+              <div className="flex justify-between py-1.5 border-b border-slate-100">
+                <span className="text-slate-500 font-medium">Status Bit Index</span>
+                <span className="font-mono text-slate-800">Bit #{credential.statusIndex}</span>
+              </div>
+              <div className="flex justify-between py-1.5">
+                <span className="text-slate-500 font-medium">Issuer DID</span>
+                <TruncatedHash value={credential.issuer.did} start={14} end={8} />
+              </div>
+            </CardContent>
+          </Card>
         </div>
 
-        <div className="mt-8 bg-blue-50 rounded-xl p-5">
-          <p className="font-semibold text-blue-800">🔐 Verified Credential</p>
-          <p className="text-sm text-blue-700 mt-2">
-            {credential.issuer.trusted
-              ? 'This credential was issued by a trusted organization'
-              : 'The issuer of this credential is not currently trusted'}
-            {credential.status === 'valid'
-              ? ' and its current status is valid.'
-              : ` and its status is ${credential.status}.`}
-          </p>
+        {/* Right: Security & Trust Card */}
+        <div className="lg:col-span-4 space-y-6">
+          <Card className="border-blue-100 bg-blue-50/50">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-blue-900">
+                <ShieldCheck className="h-5 w-5 text-blue-600" />
+                <span>Issuer Trust Status</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-xs text-slate-600">
+              <p>
+                {credential.issuer.trusted ? (
+                  <span className="text-emerald-700 font-medium flex items-center gap-1.5">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
+                    Issuer is verified in the GitLink Trust Registry.
+                  </span>
+                ) : (
+                  <span className="text-amber-700 font-medium flex items-center gap-1.5">
+                    <XCircle className="h-4 w-4 text-amber-600 shrink-0" />
+                    Issuer status is unverified or pending.
+                  </span>
+                )}
+              </p>
+              <p className="leading-relaxed">
+                When you share this credential with a relying party (e.g., employer or bank), they
+                will verify the signature and trust registry directly without contacting the issuer.
+              </p>
+              {credential.status === 'valid' && (
+                <div className="pt-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    fullWidth
+                    icon={<Share2 className="h-4 w-4" />}
+                    onClick={() => onShare(credential)}
+                  >
+                    Share Credential
+                  </Button>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
-
-        {credential.status === 'valid' && (
-          <button type="button" onClick={() => onShare(credential)} className={`mt-6 ${BTN_PRIMARY}`}>
-            Share this credential →
-          </button>
-        )}
       </div>
     </div>
   );
 }
 
-function Detail({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div>
-      <p className="text-sm text-slate-500">{label}</p>
-      <p className={`font-semibold mt-1 break-all ${mono ? 'font-mono text-xs' : ''}`}>{value}</p>
-    </div>
-  );
-}
+/* ------------------------------------------------------------------ */
+/* add document with validation (Task 5)                              */
+/* ------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------ */
-/* add document → review → pending                                     */
-/* ------------------------------------------------------------------ */
+const ALLOWED_MIMES = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg'];
+const ALLOWED_EXTS = ['.pdf', '.png', '.jpg', '.jpeg'];
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 
 function AddDocumentScreen({
   draft,
@@ -870,122 +1193,249 @@ function AddDocumentScreen({
   onContinue: () => void;
 }) {
   const [reading, setReading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [fileError, setFileError] = useState<string | null>(null);
-  const orgs = useRequest(() => api.organizations(draft.type), `eligible-orgs-${draft.type}`);
-  const hint = DOCUMENT_TYPES.find((d) => d.value === draft.type)?.hint;
+
+  // Fetch all organizations that can issue (no fixed type restriction)
+  const orgs = useRequest(() => api.organizations(), 'eligible-orgs');
 
   async function handleFile(file: File | undefined) {
     if (!file) return;
     setFileError(null);
-    if (file.size > 25 * 1024 * 1024) {
-      setFileError('Please choose a file smaller than 25 MB.');
+
+    // 1. File Type validation (pdf, png, jpg)
+    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+    const isAllowedExt = ALLOWED_EXTS.includes(ext);
+    const isAllowedMime = ALLOWED_MIMES.includes(file.type);
+
+    if (!isAllowedExt && !isAllowedMime) {
+      setFileError('Invalid file type. Only PDF, PNG, and JPG files are supported.');
       return;
     }
+
+    // 2. File Size validation (max 10 MB)
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      setFileError(
+        `File size (${formatBytes(file.size)}) exceeds the maximum allowed limit of 10 MB.`,
+      );
+      return;
+    }
+
+    // 3. Show reading / hashing progress
     setReading(true);
+    setUploadProgress(20);
+
     try {
+      const step1 = setTimeout(() => setUploadProgress(65), 150);
       const hash = await sha256Hex(file);
-      setDraft({ ...draft, file: { name: file.name, size: file.size, mime: file.type, hash } });
+      clearTimeout(step1);
+      setUploadProgress(100);
+
+      setTimeout(() => {
+        setDraft({
+          ...draft,
+          documentName: draft.documentName || file.name.replace(/\.[^/.]+$/, ''),
+          rawFile: file,
+          file: {
+            name: file.name,
+            size: file.size,
+            mime: file.type || (ext === '.pdf' ? 'application/pdf' : 'image/jpeg'),
+            hash,
+          },
+        });
+        setReading(false);
+        setUploadProgress(0);
+      }, 250);
     } catch {
-      setFileError('Could not read that file. Try another one.');
-    } finally {
+      setFileError('Could not process this file. Please try another one.');
       setReading(false);
+      setUploadProgress(0);
     }
   }
 
-  const ready = Boolean(draft.file) && draft.organizationId !== '' && draft.purpose.trim().length >= 3;
+  const ready =
+    Boolean(draft.file) &&
+    draft.documentName.trim().length > 0 &&
+    draft.organizationId !== '' &&
+    draft.purpose.trim().length >= 3;
 
   return (
-    <div>
-      <BackButton onClick={onBack}>← Back to Dashboard</BackButton>
-      <PageTitle title="Add Document" subtitle="Upload a document to submit it for verification." />
+    <div className="space-y-6">
+      <PageHeader
+        title="Add Document"
+        subtitle="Upload a document to request cryptographic verification and document issuance."
+        backButton={{ label: 'Back to Dashboard', onClick: onBack }}
+      />
 
-      <div className="bg-white rounded-2xl p-8 mt-6 max-w-2xl shadow-sm border">
-        <label className="text-sm font-semibold text-slate-700" htmlFor="doc-type">
-          Document Type
-        </label>
-        <select
-          id="doc-type"
-          value={draft.type}
-          onChange={(e) => setDraft({ ...draft, type: e.target.value, organizationId: '', organizationName: '' })}
-          className={INPUT}
-        >
-          {DOCUMENT_TYPES.map((d) => (
-            <option key={d.value} value={d.value}>
-              {d.label}
-            </option>
-          ))}
-        </select>
-        {hint && <p className="text-xs text-slate-500 mt-1">{hint}</p>}
-
-        <label className="text-sm font-semibold text-slate-700 block mt-6" htmlFor="doc-org">
-          Issuer
-        </label>
-        <select
-          id="doc-org"
-          value={draft.organizationId}
-          disabled={orgs.loading}
-          onChange={(e) => {
-            const id = e.target.value === '' ? '' : Number(e.target.value);
-            const org = orgs.data?.organizations.find((o) => o.id === id);
-            setDraft({ ...draft, organizationId: id, organizationName: org?.name ?? '' });
-          }}
-          className={INPUT}
-        >
-          <option value="">{orgs.loading ? 'Loading trusted organizations…' : 'Choose the issuing organization…'}</option>
-          {(orgs.data?.organizations ?? []).map((o) => (
-            <option key={o.id} value={o.id}>
-              {o.name} ({o.orgType ?? 'Organization'})
-            </option>
-          ))}
-        </select>
-        {orgs.error && <p className="text-xs text-rose-600 mt-1">{orgs.error}</p>}
-
-        <label className="text-sm font-semibold text-slate-700 block mt-6" htmlFor="doc-file">
-          Upload Document
-        </label>
-        <input
-          id="doc-file"
-          type="file"
-          onChange={(e) => void handleFile(e.target.files?.[0])}
-          className={INPUT}
-        />
-        {reading && <p className="text-xs text-slate-500 mt-2">Reading file…</p>}
-        {fileError && <p className="text-xs text-rose-600 mt-2">{fileError}</p>}
-
-        {draft.file && (
-          <div className="mt-4 bg-blue-50 rounded-xl p-4">
-            <p className="text-xs text-blue-600 font-semibold">SELECTED FILE</p>
-            <p className="font-medium text-slate-800 mt-1 break-all">{draft.file.name}</p>
-            <p className="text-xs text-slate-500 mt-1">
-              {formatBytes(draft.file.size)} · fingerprint {shortHash(draft.file.hash, 10, 6)}
-            </p>
+      <Card className="max-w-2xl">
+        <CardContent className="space-y-5 pt-2">
+          {/* Document Name */}
+          <div>
+            <label className="text-sm font-semibold uppercase tracking-wider text-slate-600 block mb-1.5" htmlFor="doc-name">
+              Document Name
+            </label>
+            <input
+              id="doc-name"
+              type="text"
+              value={draft.documentName}
+              onChange={(e) => setDraft({ ...draft, documentName: e.target.value })}
+              className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-base text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="e.g. Bachelor of Computer Applications, Degree Certificate, Employment Letter"
+            />
+            <p className="text-xs text-slate-500 mt-1">Enter the official title of the document.</p>
           </div>
-        )}
 
-        <label className="text-sm font-semibold text-slate-700 block mt-6" htmlFor="doc-purpose">
-          Purpose
-        </label>
-        <input
-          id="doc-purpose"
-          type="text"
-          value={draft.purpose}
-          maxLength={500}
-          onChange={(e) => setDraft({ ...draft, purpose: e.target.value })}
-          className={INPUT}
-        />
+          {/* Issuing Organization */}
+          <div>
+            <label className="text-sm font-semibold uppercase tracking-wider text-slate-600 block mb-1.5" htmlFor="doc-org">
+              Issuing Organization
+            </label>
+            <select
+              id="doc-org"
+              value={draft.organizationId}
+              disabled={orgs.loading}
+              onChange={(e) => {
+                const id = e.target.value === '' ? '' : Number(e.target.value);
+                const org = orgs.data?.organizations.find((o) => o.id === id);
+                setDraft({ ...draft, organizationId: id, organizationName: org?.name ?? '' });
+              }}
+              className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-base text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="">
+                {orgs.loading ? 'Loading trusted organizations…' : 'Choose eligible organization…'}
+              </option>
+              {(orgs.data?.organizations ?? []).map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.name} ({o.orgType ?? 'Organization'})
+                </option>
+              ))}
+            </select>
+            {orgs.error && <p className="text-xs text-rose-600 mt-1">{orgs.error}</p>}
+          </div>
 
-        <div className="mt-6 bg-slate-50 rounded-xl p-5">
-          <p className="font-semibold text-slate-700">🔐 Your document is protected</p>
-          <p className="text-sm text-slate-500 mt-2">
-            LifeLink sends the issuing organization a fingerprint of your file, not the file itself. You
-            control who can access the resulting credential.
-          </p>
-        </div>
+          {/* File Upload Zone */}
+          <div>
+            <label className="text-sm font-semibold uppercase tracking-wider text-slate-600 block mb-1.5" htmlFor="doc-file">
+              Upload Document File
+            </label>
 
-        <button type="button" onClick={onContinue} disabled={!ready || reading} className={`mt-6 ${BTN_PRIMARY}`}>
-          Continue →
-        </button>
-      </div>
+            {!draft.file ? (
+              <div className="rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50/60 p-6 text-center hover:bg-slate-50 transition-colors">
+                <UploadCloud className="h-8 w-8 text-blue-600 mx-auto mb-2" />
+                <p className="text-sm font-semibold text-slate-700">
+                  Select a document file to verify
+                </p>
+                <p className="text-xs text-slate-500 mt-1">
+                  Supported formats: PDF, PNG, JPG (maximum size 10 MB)
+                </p>
+                <div className="mt-3">
+                  <input
+                    id="doc-file"
+                    type="file"
+                    accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
+                    onChange={(e) => void handleFile(e.target.files?.[0])}
+                    className="block w-full text-sm text-slate-500 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer"
+                  />
+                </div>
+
+                {reading && (
+                  <div className="mt-4 space-y-1.5">
+                    <div className="flex justify-between text-xs text-slate-600">
+                      <span>Computing SHA-256 fingerprint…</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <div className="h-1.5 w-full bg-slate-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-blue-600 transition-all duration-200 rounded-full"
+                        style={{ width: `${uploadProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Rich File Preview Card */
+              <div className="rounded-2xl border border-blue-200 bg-blue-50/50 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3 min-w-0">
+                    <div className="p-2.5 rounded-xl bg-blue-600 text-white shrink-0 mt-0.5">
+                      <FileCheck2 className="h-5 w-5" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold uppercase tracking-wider text-blue-700">
+                        Selected Document Preview
+                      </p>
+                      <p className="text-base font-bold text-slate-900 truncate mt-0.5">
+                        {draft.file.name}
+                      </p>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-600">
+                        <Badge tone="info" size="sm">
+                          {draft.file.mime.includes('pdf') ? 'PDF' : 'IMAGE'}
+                        </Badge>
+                        <span>{formatBytes(draft.file.size)}</span>
+                        <span>·</span>
+                        <span>{draft.file.mime}</span>
+                      </div>
+                      <div className="mt-2 text-xs">
+                        <span className="text-slate-500 font-semibold mr-1">SHA-256:</span>
+                        <TruncatedHash value={draft.file.hash} start={12} end={8} />
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setDraft({ ...draft, file: null, rawFile: null })}
+                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
+                    aria-label="Remove file"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {fileError && <p className="text-xs text-rose-600 mt-2 font-medium">{fileError}</p>}
+          </div>
+
+          {/* Verification Purpose */}
+          <div>
+            <label className="text-sm font-semibold uppercase tracking-wider text-slate-600 block mb-1.5" htmlFor="doc-purpose">
+              Purpose / Notes for Reviewer
+            </label>
+            <input
+              id="doc-purpose"
+              type="text"
+              value={draft.purpose}
+              maxLength={500}
+              onChange={(e) => setDraft({ ...draft, purpose: e.target.value })}
+              className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-base text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="e.g. Official verification for education / employment record"
+            />
+          </div>
+
+          {/* Security notice */}
+          <div className="rounded-xl bg-slate-50 p-4 border border-slate-200/80 text-xs text-slate-600 leading-relaxed">
+            <span className="font-semibold text-slate-800 block mb-0.5">
+              Privacy Notice:
+            </span>
+            GitLink encrypts and stores your document file at rest with AES-256-GCM so only authorized
+            organizations you consent to can view it.
+          </div>
+
+          <div className="pt-2 flex justify-end">
+            <Button
+              variant="primary"
+              size="md"
+              disabled={!ready || reading}
+              onClick={onContinue}
+              iconRight={<ArrowRight className="h-4 w-4" />}
+            >
+              Continue to Review
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -1003,58 +1453,76 @@ function DocumentReview({
   onBack: () => void;
   onSubmit: () => void;
 }) {
-  const typeLabel = DOCUMENT_TYPES.find((d) => d.value === draft.type)?.label ?? draft.type;
   return (
-    <div>
-      <BackButton onClick={onBack}>← Back</BackButton>
-      <PageTitle title="Review Document" subtitle="Check the details before submitting the document." />
+    <div className="space-y-6">
+      <PageHeader
+        title="Review Document Submission"
+        subtitle="Confirm details before sending to the issuing organization."
+        backButton={{ label: 'Back to Edit', onClick: onBack }}
+      />
 
-      <div className="bg-white rounded-2xl p-8 mt-6 max-w-2xl shadow-sm border">
-        <div className="bg-blue-50 rounded-xl p-5">
-          <p className="text-xs text-blue-600 font-semibold">DOCUMENT TYPE</p>
-          <p className="text-xl font-bold text-slate-800 mt-2">{typeLabel}</p>
-        </div>
-
-        <div className="mt-6">
-          <p className="text-sm text-slate-500">Issuer</p>
-          <p className="font-semibold mt-1">{draft.organizationName || `Organization #${draft.organizationId}`}</p>
-        </div>
-
-        <div className="mt-6">
-          <p className="text-sm text-slate-500">File Name</p>
-          <p className="font-semibold mt-1 break-all">{draft.file?.name}</p>
-        </div>
-
-        <div className="mt-6">
-          <p className="text-sm text-slate-500">Purpose</p>
-          <p className="font-semibold mt-1">{draft.purpose}</p>
-        </div>
-
-        <div className="mt-6">
-          <p className="text-sm text-slate-500">Next Step</p>
-          <p className="font-semibold mt-1">Submit credential for verification</p>
-        </div>
-
-        <div className="mt-6 bg-amber-50 rounded-xl p-5">
-          <p className="font-semibold text-amber-700">🟡 Verification Required</p>
-          <p className="text-sm text-amber-700 mt-2">
-            Uploading a document does not automatically make it verified. The issuing organization must
-            review it and sign a credential before it counts.
-          </p>
-        </div>
-
-        <InlineError error={error} />
-
-        <button type="button" onClick={onSubmit} disabled={pending} className={`mt-6 ${BTN_PRIMARY}`}>
-          {pending ? (
-            <span className="inline-flex items-center gap-2">
-              <Spinner /> Submitting…
+      <Card className="max-w-2xl">
+        <CardContent className="space-y-4 pt-2">
+          <div className="rounded-xl bg-blue-50 p-4 border border-blue-200">
+            <span className="text-xs font-bold uppercase tracking-wider text-blue-700">
+              Document Name
             </span>
-          ) : (
-            'Submit for Verification →'
-          )}
-        </button>
-      </div>
+            <p className="text-xl font-bold text-slate-900 mt-1">{draft.documentName}</p>
+          </div>
+
+          <dl className="divide-y divide-slate-100 text-sm">
+            <div className="flex justify-between py-2.5">
+              <dt className="text-slate-500 font-medium">Target Organization</dt>
+              <dd className="font-semibold text-slate-800">
+                {draft.organizationName || `Org #${draft.organizationId}`}
+              </dd>
+            </div>
+            <div className="flex justify-between py-2.5">
+              <dt className="text-slate-500 font-medium">File Name</dt>
+              <dd className="font-semibold text-slate-800 break-all">{draft.file?.name}</dd>
+            </div>
+            <div className="flex justify-between py-2.5">
+              <dt className="text-slate-500 font-medium">File Size</dt>
+              <dd className="font-semibold text-slate-800">
+                {draft.file ? formatBytes(draft.file.size) : '—'}
+              </dd>
+            </div>
+            <div className="flex justify-between py-2.5">
+              <dt className="text-slate-500 font-medium">File Type</dt>
+              <dd className="font-semibold text-slate-800 font-mono text-xs">
+                {draft.file?.mime}
+              </dd>
+            </div>
+            <div className="flex justify-between py-2.5">
+              <dt className="text-slate-500 font-medium">Purpose</dt>
+              <dd className="font-semibold text-slate-800">{draft.purpose}</dd>
+            </div>
+          </dl>
+
+          <div className="rounded-xl bg-amber-50 p-4 border border-amber-200 text-xs text-amber-800 leading-relaxed">
+            <span className="font-semibold block mb-0.5">Verification Required:</span>
+            Submitting this document queues it for review by {draft.organizationName}. A verifiable
+            document will be issued into your wallet upon approval.
+          </div>
+
+          <InlineError error={error} />
+
+          <div className="pt-2 flex justify-end gap-3">
+            <Button variant="secondary" size="md" onClick={onBack} disabled={pending}>
+              Back
+            </Button>
+            <Button
+              variant="primary"
+              size="md"
+              loading={pending}
+              onClick={onSubmit}
+              iconRight={<ArrowRight className="h-4 w-4" />}
+            >
+              Submit for Verification
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -1068,48 +1536,61 @@ function VerificationPending({
   message: string | null;
   onDone: () => void;
 }) {
-  const typeLabel = DOCUMENT_TYPES.find((d) => d.value === draft.type)?.label ?? draft.type;
   return (
-    <div>
-      <PageTitle title="Verification Submitted" subtitle="Your document has been submitted for verification." />
+    <div className="space-y-6">
+      <PageHeader
+        title="Verification Submitted"
+        subtitle="Your document has been sent to the issuing organization."
+      />
 
-      <div className="bg-white rounded-2xl p-8 mt-6 max-w-2xl shadow-sm border">
-        <div className="flex items-center gap-4">
-          <div className="bg-amber-100 text-amber-600 w-12 h-12 rounded-full flex items-center justify-center text-xl">
-            !
+      <Card className="max-w-2xl">
+        <CardContent className="space-y-5 pt-2">
+          <div className="flex items-center gap-3">
+            <div className="h-10 w-10 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center font-bold">
+              <Clock className="h-5 w-5" />
+            </div>
+            <div>
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                Submission Status
+              </span>
+              <h2 className="text-xl font-bold text-amber-600">Pending Review</h2>
+            </div>
           </div>
-          <div>
-            <p className="text-sm text-slate-500">VERIFICATION STATUS</p>
-            <h3 className="text-2xl font-bold text-amber-600 mt-1">Pending Verification</h3>
+
+          <div className="rounded-xl bg-slate-50 p-4 border border-slate-200 text-sm space-y-2">
+            <div className="flex justify-between">
+              <span className="text-slate-500 font-medium">Document:</span>
+              <span className="font-semibold text-slate-800">{draft.documentName}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500 font-medium">File:</span>
+              <span className="font-semibold text-slate-800 break-all">{draft.file?.name}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500 font-medium">Organization:</span>
+              <span className="font-semibold text-slate-800">{draft.organizationName}</span>
+            </div>
           </div>
-        </div>
 
-        <div className="mt-7 bg-slate-50 rounded-xl p-5">
-          <p className="text-xs text-slate-500">DOCUMENT</p>
-          <p className="font-semibold mt-1">{typeLabel}</p>
-          <p className="text-sm text-slate-500 mt-1 break-all">{draft.file?.name}</p>
-          <p className="text-xs text-slate-500 mt-4">ISSUER</p>
-          <p className="font-semibold mt-1">{draft.organizationName}</p>
-        </div>
-
-        <div className="mt-6 bg-blue-50 rounded-xl p-5">
-          <p className="font-semibold text-blue-800">🔐 What happens next?</p>
-          <p className="text-sm text-blue-700 mt-2">
+          <div className="rounded-xl bg-blue-50 p-4 border border-blue-200 text-xs text-blue-900 leading-relaxed">
+            <span className="font-semibold block mb-0.5">What happens next?</span>
             {message ??
-              'The organization reviews your document. If approved, a signed credential appears in your wallet.'}
-          </p>
-        </div>
+              'The organization will inspect your document against official records. When approved, a signed document appears automatically in your wallet.'}
+          </div>
 
-        <button type="button" onClick={onDone} className={`mt-6 ${BTN_PRIMARY}`}>
-          View My Credentials →
-        </button>
-      </div>
+          <div className="pt-2 flex justify-end">
+            <Button variant="primary" size="md" onClick={onDone}>
+              View My Documents
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* consent + result                                                    */
+/* consent screen                                                     */
 /* ------------------------------------------------------------------ */
 
 function ConsentScreen({
@@ -1119,6 +1600,8 @@ function ConsentScreen({
   setPickedFields,
   pickedCredential,
   setPickedCredential,
+  shareAttachment,
+  setShareAttachment,
   pending,
   error,
   onBack,
@@ -1131,6 +1614,8 @@ function ConsentScreen({
   setPickedFields: (fields: string[]) => void;
   pickedCredential: number | '';
   setPickedCredential: (id: number | '') => void;
+  shareAttachment: boolean;
+  setShareAttachment: (val: boolean) => void;
   pending: boolean;
   error: string | null;
   onBack: () => void;
@@ -1140,105 +1625,190 @@ function ConsentScreen({
   if (!request) {
     return (
       <div>
-        <BackButton onClick={onBack}>← Back</BackButton>
-        <p className="text-slate-500">This request is no longer open.</p>
+        <PageHeader title="Verification Request" backButton={{ label: 'Back to Dashboard', onClick: onBack }} />
+        <EmptyState title="Request not found" description="This verification request is no longer active." />
       </div>
     );
   }
 
-  const matching = credentials.filter((c) => c.type === request.credentialType);
+  const matching = credentials.filter(
+    (c) =>
+      c.type === request.credentialType ||
+      (c.claims?.documentName && String(c.claims.documentName).toLowerCase() === request.credentialType.toLowerCase()) ||
+      request.credentialType === 'DocumentCredential' ||
+      request.credentialTypeLabel === c.typeLabel,
+  );
+  const eligibleCredentials = matching.length > 0 ? matching : credentials;
   const chosen = credentials.find((c) => c.id === pickedCredential);
-  const stays = chosen
+  const staysPrivate = chosen
     ? Object.keys(chosen.claims).filter((k) => !pickedFields.includes(k))
     : [];
 
-  function toggle(field: string) {
+  function toggleField(field: string) {
     setPickedFields(
-      pickedFields.includes(field) ? pickedFields.filter((f) => f !== field) : [...pickedFields, field],
+      pickedFields.includes(field)
+        ? pickedFields.filter((f) => f !== field)
+        : [...pickedFields, field],
     );
   }
 
   return (
-    <div>
-      <BackButton onClick={onBack}>← Back</BackButton>
-      <PageTitle
-        title="Verification Request"
-        subtitle={`Review exactly what ${request.verifier.name} wants to access.`}
+    <div className="space-y-6">
+      <PageHeader
+        title="Selective Disclosure Consent"
+        subtitle={`Review what ${request.verifier.name} is requesting.`}
+        backButton={{ label: 'Back to Dashboard', onClick: onBack }}
       />
 
-      <div className="bg-white rounded-2xl p-8 mt-6 max-w-2xl shadow-sm">
-        <p className="text-xs text-slate-500">REQUESTED BY</p>
-        <h3 className="text-2xl font-bold mt-2">{request.verifier.name}</h3>
-        <p className="text-slate-500 mt-1">
-          Purpose: “{request.purpose}” · expires {relativeTime(request.expiresAt)}
-        </p>
-
-        <div className="mt-7 bg-blue-50 rounded-xl p-5">
-          <p className="font-semibold text-blue-800">Only the fields you tick will be shared</p>
-          <div className="mt-4 space-y-2">
-            {request.requestedFields.map((f) => (
-              <label key={f} className="flex items-center gap-3 bg-white rounded-lg p-4 cursor-pointer">
-                <input type="checkbox" checked={pickedFields.includes(f)} onChange={() => toggle(f)} />
-                <span className="font-medium">{fieldLabel(f)}</span>
-                {chosen && pickedFields.includes(f) && (
-                  <span className="ml-auto text-sm text-slate-500">{formatValue(chosen.claims[f])}</span>
-                )}
-              </label>
-            ))}
-          </div>
-          {stays.length > 0 && (
-            <p className="text-xs text-slate-500 mt-3">
-              Stays private: {stays.map(fieldLabel).join(', ')}
+      <Card className="max-w-2xl">
+        <CardContent className="space-y-5 pt-2">
+          <div className="rounded-xl bg-slate-50 p-4 border border-slate-200">
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+              Requesting Organization
+            </span>
+            <h3 className="text-xl font-bold text-slate-900 mt-0.5">
+              {request.verifier.name}
+            </h3>
+            <p className="text-sm text-slate-600 mt-1">
+              Purpose: “{request.purpose}” · Request expires {relativeTime(request.expiresAt)}
             </p>
+          </div>
+
+          {/* Credential Selector */}
+          <div>
+            <label className="text-sm font-semibold uppercase tracking-wider text-slate-600 block mb-1.5" htmlFor="use-cred">
+              Select Source Document
+            </label>
+            <select
+              id="use-cred"
+              value={pickedCredential}
+              onChange={(e) => {
+                const id = e.target.value === '' ? '' : Number(e.target.value);
+                setPickedCredential(id);
+                const chosenDoc = credentials.find((c) => c.id === id);
+                setShareAttachment(Boolean(chosenDoc?.attachment || chosenDoc?.attachmentId));
+              }}
+              className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-base text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="">Choose a document…</option>
+              {eligibleCredentials.map((c) => (
+                <option key={c.id} value={c.id} disabled={c.status !== 'valid'}>
+                  {String(c.claims?.documentName || c.typeLabel)} · {c.issuer.name} ({c.status})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Selective Disclosure Pick List */}
+          <div className="rounded-2xl border border-blue-200 bg-blue-50/40 p-4 sm:p-5">
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm font-bold text-blue-900">
+                Choose fields to selectively disclose
+              </span>
+              <span className="text-sm text-blue-700 font-medium">
+                {pickedFields.length} of {request.requestedFields.length} selected
+              </span>
+            </div>
+
+            <div className="space-y-2">
+              {request.requestedFields.map((f) => {
+                const checked = pickedFields.includes(f);
+                return (
+                  <label
+                    key={f}
+                    className={`flex items-center justify-between p-3.5 rounded-xl border cursor-pointer transition-colors ${
+                      checked
+                        ? 'border-blue-300 bg-white shadow-xs'
+                        : 'border-slate-200 bg-white/70 hover:bg-white'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleField(f)}
+                        className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <span className="text-base font-semibold text-slate-800">
+                        {fieldLabel(f)}
+                      </span>
+                    </div>
+
+                    {chosen && checked && (
+                      <span className="text-sm font-mono text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+                        {formatValue(chosen.claims[f])}
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+
+            {staysPrivate.length > 0 && (
+              <p className="mt-3 text-sm text-blue-700">
+                <strong>Stays mathematically hidden:</strong> {staysPrivate.map(fieldLabel).join(', ')}
+              </p>
+            )}
+          </div>
+
+          {/* Optional Attached File Sharing Checkbox */}
+          {chosen && (chosen.attachment || chosen.attachmentId) && (
+            <div className="p-4 rounded-xl border border-blue-200 bg-blue-50/70">
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={shareAttachment}
+                  onChange={(e) => setShareAttachment(e.target.checked)}
+                  className="h-5 w-5 mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div>
+                  <span className="text-base font-semibold text-slate-800 flex items-center gap-1.5">
+                    <Paperclip className="h-4 w-4 text-blue-600" />
+                    Share attached file {chosen.attachment ? `(${chosen.attachment.name})` : ''}
+                  </span>
+                  {chosen.attachment && (
+                    <span className="block text-sm text-slate-600 font-mono mt-0.5">
+                      {(chosen.attachment.size / 1024).toFixed(1)} KB · {chosen.attachment.mime}
+                    </span>
+                  )}
+                  <span className="text-xs text-slate-500 block mt-1">
+                    If ticked, the verifier will be granted temporary cryptographic access to inspect this original file while your consent remains active.
+                  </span>
+                </div>
+              </label>
+            </div>
           )}
-        </div>
 
-        <label className="text-sm font-semibold text-slate-700 block mt-6" htmlFor="use-cred">
-          Credential to use
-        </label>
-        <select
-          id="use-cred"
-          value={pickedCredential}
-          onChange={(e) => setPickedCredential(e.target.value === '' ? '' : Number(e.target.value))}
-          className={INPUT}
-        >
-          <option value="">Choose…</option>
-          {matching.map((c) => (
-            <option key={c.id} value={c.id} disabled={c.status !== 'valid'}>
-              {c.typeLabel} · {c.issuer.name} ({c.status})
-            </option>
-          ))}
-        </select>
-        {matching.length === 0 && (
-          <p className="text-sm text-rose-600 mt-2">
-            You don’t have a {request.credentialTypeLabel} credential yet, so you can’t answer this request.
-          </p>
-        )}
+          <InlineError error={error} />
 
-        <InlineError error={error} />
-
-        <div className="flex gap-3 mt-6">
-          <button
-            type="button"
-            onClick={onApprove}
-            disabled={pending || pickedCredential === '' || pickedFields.length === 0}
-            className={BTN_PRIMARY}
-          >
-            {pending ? 'Working…' : `Approve & Share (${pickedFields.length})`}
-          </button>
-          <button
-            type="button"
-            onClick={onDeny}
-            disabled={pending}
-            className="border border-slate-300 px-6 py-3 rounded-xl hover:bg-slate-50 disabled:opacity-50"
-          >
-            Deny
-          </button>
-        </div>
-      </div>
+          <div className="pt-2 flex justify-end gap-3">
+            <Button
+              variant="danger-outline"
+              size="md"
+              disabled={pending}
+              onClick={onDeny}
+            >
+              Deny Request
+            </Button>
+            <Button
+              variant="primary"
+              size="md"
+              loading={pending}
+              disabled={pickedCredential === '' || pickedFields.length === 0}
+              onClick={onApprove}
+            >
+              Approve &amp; Disclose ({pickedFields.length})
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* result screen                                                      */
+/* ------------------------------------------------------------------ */
 
 function ResultScreen({
   result,
@@ -1249,98 +1819,77 @@ function ResultScreen({
   credential: Credential | null;
   onDone: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
-  if (!result) {
-    return (
-      <div>
-        <PageTitle title="Verification Result" />
-        <button type="button" onClick={onDone} className={`mt-6 ${BTN_PRIMARY}`}>
-          Return to Dashboard
-        </button>
-      </div>
-    );
-  }
-  const revealed = Object.entries(result.reveals);
   return (
-    <div>
-      <PageTitle title="Shared Successfully" />
+    <div className="space-y-6">
+      <PageHeader
+        title="Presentation Shared"
+        subtitle="Your cryptographic presentation was created and verified."
+      />
 
-      <div className="bg-white rounded-2xl p-8 mt-6 max-w-2xl shadow-sm">
-        <div className="space-y-4">
-          <p className={`font-semibold ${credential?.issuer.trusted ? 'text-green-600' : 'text-amber-600'}`}>
-            {credential?.issuer.trusted ? '✓ Issuer Trusted' : '• Issuer trust unknown'}
-          </p>
-          <p className={`font-semibold ${credential?.status === 'valid' ? 'text-green-600' : 'text-amber-600'}`}>
-            {credential?.status === 'valid' ? '✓ Credential Not Revoked' : `• Credential ${credential?.status ?? 'status unknown'}`}
-          </p>
-          <p className="text-green-600 font-semibold">
-            ✓ Consent #{result.consent.id} recorded · expires {relativeTime(result.consent.expiresAt)}
-          </p>
-        </div>
-
-        <div className="mt-8 bg-green-50 rounded-xl p-6">
-          <h3 className="text-2xl font-bold text-green-700">ACCESS GRANTED</h3>
-          <p className="mt-2 text-green-700">
-            {revealed.length} field{revealed.length === 1 ? '' : 's'} shared with {result.verifier.name}.
-          </p>
-          <ul className="mt-4 space-y-1">
-            {revealed.map(([key, value]) => (
-              <li key={key} className="text-sm text-green-900">
-                <span className="text-green-700">{fieldLabel(key)}:</span>{' '}
-                <span className="font-semibold">{formatValue(value)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-
-        {result.hidden.length > 0 && (
-          <div className="mt-5 bg-slate-50 rounded-xl p-5">
-            <p className="text-xs text-slate-500">STAYED PRIVATE</p>
-            <p className="text-sm text-slate-700 mt-2">{result.hidden.map(fieldLabel).join(', ')}</p>
+      <Card className="max-w-2xl">
+        <CardContent className="space-y-5 pt-2">
+          <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 p-5 text-emerald-900">
+            <div className="flex items-center gap-3">
+              <CheckCircle2 className="h-7 w-7 text-emerald-600 shrink-0" />
+              <div>
+                <h2 className="text-lg font-bold">Successfully Shared with Verifier</h2>
+                <p className="text-xs opacity-90 mt-0.5">
+                  Only the claims you consented to were included. All other fields were excluded.
+                </p>
+              </div>
+            </div>
           </div>
-        )}
 
-        <details className="mt-5">
-          <summary className="cursor-pointer text-xs font-semibold text-slate-600">
-            Show the raw presentation (this is all the verifier receives)
-          </summary>
-          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-900 p-3 font-mono text-[10px] text-slate-100">
-            {result.presentation}
-          </pre>
-        </details>
+          {result && (
+            <div className="space-y-3">
+              <div className="rounded-xl bg-slate-50 p-4 border border-slate-200 text-xs space-y-2">
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-medium">Verifier:</span>
+                  <span className="font-semibold text-slate-800">{result.verifier.name}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-medium">Credential:</span>
+                  <span className="font-semibold text-slate-800">
+                    {credential?.typeLabel ?? 'Credential'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-medium">Consent Record:</span>
+                  <span className="font-mono text-slate-800">#{result.consent.id}</span>
+                </div>
+              </div>
 
-        <div className="flex gap-3 mt-6">
-          <button type="button" onClick={onDone} className={BTN_PRIMARY}>
-            Return to Dashboard
-          </button>
-          <button
-            type="button"
-            className="border border-slate-300 px-6 py-3 rounded-xl hover:bg-slate-50"
-            onClick={() => {
-              void navigator.clipboard
-                ?.writeText(result.presentation)
-                .then(() => setCopied(true))
-                .catch(() => undefined);
-            }}
-          >
-            {copied ? 'Copied ✓' : 'Copy presentation'}
-          </button>
-        </div>
-      </div>
+              <div>
+                <span className="text-xs font-semibold uppercase tracking-wider text-slate-600 block mb-1">
+                  Presentation Token (SD-JWT+KB):
+                </span>
+                <div className="mt-1">
+                  <TruncatedHash value={result.presentation} start={20} end={14} />
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="pt-2 flex justify-end">
+            <Button variant="primary" size="md" onClick={onDone}>
+              Back to Dashboard
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* history, audit, settings                                            */
+/* sharing history                                                    */
 /* ------------------------------------------------------------------ */
 
-const CONSENT_BADGE: Record<string, { label: string; className: string }> = {
-  active: { label: 'Approved', className: 'text-green-600' },
-  pending: { label: 'Waiting for you', className: 'text-amber-600' },
-  rejected: { label: 'Denied', className: 'text-slate-500' },
-  expired: { label: 'Expired', className: 'text-amber-600' },
-  ended: { label: 'Ended', className: 'text-slate-500' },
+const CONSENT_BADGE: Record<string, { label: string; tone: string }> = {
+  active: { label: 'Active', tone: 'active' },
+  ended: { label: 'Ended', tone: 'neutral' },
+  revoked: { label: 'Revoked', tone: 'danger' },
+  expired: { label: 'Expired', tone: 'warning' },
 };
 
 function HistoryScreen({
@@ -1373,97 +1922,150 @@ function HistoryScreen({
   onEnd: (consent: Consent) => void;
 }) {
   return (
-    <div>
-      <PageTitle title="Sharing History" subtitle="See where your credentials have been shared." />
+    <div className="space-y-6">
+      <PageHeader
+        title="Sharing History & Consents"
+        subtitle="Manage active consents, audit who checked your credentials, and revoke access at any time."
+        actions={
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<RotateCcw className="h-3.5 w-3.5" />}
+            onClick={onRetry}
+          >
+            Refresh
+          </Button>
+        }
+      />
 
-      {loading && <div className="mt-8"><LoadingBlock label="Loading your sharing history…" /></div>}
-      {error && <div className="mt-8"><ErrorBlock message={error} onRetry={onRetry} /></div>}
+      {loading && !consents.length && <SkeletonList count={3} />}
+      {error && <ErrorBlock message={error} onRetry={onRetry} />}
       <InlineError error={endError} />
 
-      {!loading && !error && consents.length === 0 && (
-        <div className="bg-white rounded-2xl mt-8 shadow-sm border p-6 text-slate-500">
-          You haven’t shared anything yet.
-        </div>
-      )}
+      {/* Consents List */}
+      <div className="space-y-3">
+        <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+          <History className="h-5 w-5 text-blue-600" />
+          <span>Active &amp; Past Sharing Consents</span>
+        </h2>
 
-      {consents.length > 0 && (
-        <div className="bg-white rounded-2xl mt-8 shadow-sm border">
-          {consents.map((c, index) => {
-            const badge = CONSENT_BADGE[c.state] ?? { label: c.state, className: 'text-slate-500' };
+        {!loading && consents.length === 0 && (
+          <EmptyState
+            icon={<History className="h-6 w-6" />}
+            title="No sharing sessions"
+            description="You haven't shared any credentials with relying parties yet."
+          />
+        )}
+
+        <div className="space-y-3">
+          {consents.map((c) => {
+            const badgeInfo = CONSENT_BADGE[c.state] ?? { label: c.state, tone: 'neutral' };
             return (
-              <div key={c.id} className={`p-6 ${index < consents.length - 1 ? 'border-b' : ''}`}>
-                <div className="flex justify-between gap-4">
-                  <div>
-                    <h3 className="font-bold">{c.verifier?.name ?? 'Unknown verifier'}</h3>
-                    <p className="text-sm text-slate-500 mt-1">{c.purpose}</p>
+              <Card key={c.id} className="p-4 sm:p-5">
+                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-bold text-slate-900">
+                        {c.verifier?.name ?? 'Relying Party'}
+                      </h3>
+                      <Badge tone={badgeInfo.tone}>{badgeInfo.label}</Badge>
+                      <span className="text-xs font-mono text-slate-400">#{c.id}</span>
+                    </div>
+                    <p className="text-xs text-slate-600">Purpose: “{c.purpose}”</p>
+                    <div className="mt-2.5 rounded-xl bg-slate-50 p-2.5 border border-slate-100">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                        Disclosed Fields
+                      </span>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {c.fields.map((f) => (
+                          <Badge key={f} tone="info" size="sm">
+                            {fieldLabel(f)}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
                   </div>
-                  <span className={`font-semibold text-sm ${badge.className}`}>{badge.label}</span>
-                </div>
 
-                <div className="mt-4 bg-slate-50 rounded-xl p-4">
-                  <p className="text-xs text-slate-500">DATA SHARED</p>
-                  <p className="font-semibold mt-1">
-                    {c.fields.length > 0 ? c.fields.map(fieldLabel).join(', ') : '—'}
-                  </p>
-                </div>
-
-                <div className="flex items-center justify-between mt-4">
-                  <p className="text-xs text-slate-400">
-                    {formatDateTime(c.createdAt)}
-                    {c.state === 'active' ? ` · expires ${relativeTime(c.expiresAt)}` : ''}
-                  </p>
                   {c.state === 'active' && (
-                    <button
-                      type="button"
+                    <Button
+                      variant="danger-outline"
+                      size="xs"
                       disabled={ending}
                       onClick={() => onEnd(c)}
-                      className="text-sm font-semibold text-rose-600 hover:text-rose-800 disabled:opacity-50"
                     >
-                      End sharing
-                    </button>
+                      End Sharing Access
+                    </Button>
                   )}
                 </div>
-              </div>
+
+                <div className="mt-3 pt-2.5 border-t border-slate-100 flex items-center justify-between text-xs text-slate-400">
+                  <span>Created {formatDateTime(c.createdAt)}</span>
+                  {c.state === 'active' && <span>Expires {relativeTime(c.expiresAt)}</span>}
+                </div>
+              </Card>
             );
           })}
         </div>
-      )}
+      </div>
 
-      <h3 className="text-xl font-bold text-slate-800 mt-10 mb-4">
-        Who verified my records
-        {verificationSummary && (
-          <span className="ml-3 text-sm font-normal text-slate-400">
-            {verificationSummary.granted} granted · {verificationSummary.denied} denied
-          </span>
-        )}
-      </h3>
-      <div className="bg-white rounded-2xl shadow-sm border">
-        {verifications.length === 0 && (
-          <p className="p-6 text-sm text-slate-500">Nobody has verified your records yet.</p>
-        )}
-        {verifications.map((v, index) => (
-          <div key={v.eventId} className={`p-5 ${index < verifications.length - 1 ? 'border-b' : ''}`}>
-            <div className="flex justify-between gap-4">
-              <p className="font-semibold">
-                {v.verifier.name}
-                <span className="font-normal text-slate-500"> checked your {v.credential?.typeLabel ?? 'credential'}</span>
-              </p>
-              <span className={`text-sm font-semibold ${v.result === 'granted' ? 'text-green-600' : 'text-rose-600'}`}>
-                {v.result === 'granted' ? '✓ Granted' : '✕ Denied'}
-              </span>
+      {/* Verifications Audit History */}
+      <div className="space-y-3 pt-6 border-t border-slate-200">
+        <div className="flex items-center justify-between">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <Eye className="h-5 w-5 text-blue-600" />
+            <span>Who Verified My Records</span>
+          </h2>
+          {verificationSummary && (
+            <div className="flex items-center gap-1.5">
+              <Badge tone="success">{verificationSummary.granted} Granted</Badge>
+              <Badge tone="danger">{verificationSummary.denied} Denied</Badge>
             </div>
-            <p className="text-xs text-slate-500 mt-2">
-              {v.result === 'granted'
-                ? `Saw: ${v.revealedFields.map(fieldLabel).join(', ') || '—'}`
-                : `Denied because: ${v.deniedBecause.join(', ') || 'unknown reason'}`}
-            </p>
-            <p className="text-xs text-slate-400 mt-1">{formatDateTime(v.createdAt)}</p>
-          </div>
-        ))}
+          )}
+        </div>
+
+        {verifications.length === 0 && (
+          <EmptyState
+            icon={<Eye className="h-6 w-6" />}
+            title="No verifications logged yet"
+            description="When an organization checks your presentation, the verification event will be recorded here."
+          />
+        )}
+
+        <div className="space-y-2.5">
+          {verifications.map((v) => (
+            <Card key={v.eventId} className="p-3.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-slate-900 truncate">
+                    {v.verifier.name}{' '}
+                    <span className="font-normal text-slate-500">
+                      checked your {v.credential?.typeLabel ?? 'credential'}
+                    </span>
+                  </p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    {v.result === 'granted'
+                      ? `Disclosed claims: ${v.revealedFields.map(fieldLabel).join(', ') || 'none'}`
+                      : `Denied: ${v.deniedBecause.join(', ') || 'unspecified reason'}`}
+                  </p>
+                </div>
+                <Badge tone={v.result === 'granted' ? 'granted' : 'denied'} size="sm">
+                  {v.result === 'granted' ? '✓ Granted' : '✕ Denied'}
+                </Badge>
+              </div>
+              <p className="text-[10px] text-slate-400 mt-2 font-mono">
+                {formatDateTime(v.createdAt)}
+              </p>
+            </Card>
+          ))}
+        </div>
       </div>
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* citizen audit screen                                               */
+/* ------------------------------------------------------------------ */
 
 function AuditScreen({
   loading,
@@ -1475,71 +2077,125 @@ function AuditScreen({
   error: string | null;
   onRetry: () => void;
   data: {
-    entries: { id: number; eventType: string; payload: unknown; prevHash: string; hash: string; createdAt: string }[];
+    entries: {
+      id: number;
+      eventType: string;
+      payload: unknown;
+      prevHash: string;
+      hash: string;
+      createdAt: string;
+    }[];
     chain: { valid: boolean; length: number; reason: string | null; brokenAtEntry: number | null };
   } | null;
 }) {
   return (
-    <div>
-      <PageTitle title="Audit Log" subtitle="A transparent record of identity activity." />
+    <div className="space-y-6">
+      <PageHeader
+        title="Wallet Audit Log"
+        subtitle="Transparent, tamper-evident cryptographic log of all wallet actions."
+        badge={
+          data && (
+            <Badge tone={data.chain.valid ? 'trusted' : 'danger'} size="md">
+              {data.chain.valid ? 'Chain Intact' : 'Broken'}
+            </Badge>
+          )
+        }
+        actions={
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<RotateCcw className="h-3.5 w-3.5" />}
+            onClick={onRetry}
+          >
+            Refresh
+          </Button>
+        }
+      />
 
-      {loading && !data && <div className="mt-8"><LoadingBlock label="Reading the audit log…" /></div>}
-      {error && <div className="mt-8"><ErrorBlock message={error} onRetry={onRetry} /></div>}
+      {loading && !data && <SkeletonList count={3} />}
+      {error && <ErrorBlock message={error} onRetry={onRetry} />}
 
       {data && (
         <>
           <div
-            className={`mt-8 rounded-2xl border p-5 ${
-              data.chain.valid ? 'border-green-200 bg-green-50' : 'border-rose-300 bg-rose-50'
+            className={`rounded-2xl border p-4 sm:p-5 flex items-start gap-3 ${
+              data.chain.valid
+                ? 'border-emerald-200 bg-emerald-50/80 text-emerald-900'
+                : 'border-rose-200 bg-rose-50/80 text-rose-900'
             }`}
           >
-            <p className={`font-bold ${data.chain.valid ? 'text-green-700' : 'text-rose-700'}`}>
-              {data.chain.valid
-                ? `✓ Hash chain intact (${data.chain.length} entries checked)`
-                : `✕ Chain broken at entry #${data.chain.brokenAtEntry ?? '?'}`}
-            </p>
-            {!data.chain.valid && data.chain.reason && (
-              <p className="text-xs text-rose-700 mt-1">{data.chain.reason}</p>
+            {data.chain.valid ? (
+              <CheckCircle2 className="h-6 w-6 text-emerald-600 shrink-0" />
+            ) : (
+              <XCircle className="h-6 w-6 text-rose-600 shrink-0" />
             )}
+            <div>
+              <p className="text-base font-bold">
+                {data.chain.valid
+                  ? `Cryptographic hash chain intact (${data.chain.length} events checked)`
+                  : `Hash chain broken at entry #${data.chain.brokenAtEntry ?? '?'}`}
+              </p>
+              {!data.chain.valid && data.chain.reason && (
+                <p className="text-xs text-rose-700 mt-1">{data.chain.reason}</p>
+              )}
+            </div>
           </div>
 
-          {data.entries.length === 0 && (
-            <div className="bg-white rounded-2xl mt-5 p-6 shadow-sm border text-slate-500">No events yet.</div>
-          )}
+          <div className="space-y-3">
+            {data.entries.length === 0 && (
+              <EmptyState title="No audit events" description="Your audit log is currently empty." />
+            )}
 
-          <div className="mt-5 space-y-5">
             {data.entries.map((entry) => {
               const style = EVENT_STYLES[entry.eventType];
               return (
-                <div key={entry.id} className="bg-white rounded-2xl p-6 shadow-sm border">
-                  <div className="flex gap-4">
-                    <div className="bg-blue-100 text-blue-600 w-10 h-10 rounded-full flex items-center justify-center shrink-0">
-                      ✓
+                <Card key={entry.id} className="p-4 sm:p-5">
+                  <div className="flex items-start gap-3.5">
+                    <div className="h-8 w-8 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 mt-0.5">
+                      <CheckCircle2 className="h-4 w-4" />
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex justify-between gap-3">
-                        <h3 className="font-bold">{style?.label ?? entry.eventType}</h3>
-                        <span className="text-xs text-slate-400">{formatDateTime(entry.createdAt)}</span>
+                        <h3 className="text-sm font-bold text-slate-900">
+                          {style?.label ?? entry.eventType}
+                        </h3>
+                        <span className="text-xs text-slate-400">
+                          {formatDateTime(entry.createdAt)}
+                        </span>
                       </div>
 
-                      <div className="mt-4 bg-slate-50 rounded-xl p-4">
-                        <p className="text-xs text-slate-400">AUDIT EVENT</p>
-                        <p className="text-sm font-mono mt-2">AUD-{String(entry.id).padStart(5, '0')}</p>
-                        <p className="text-xs text-slate-400 mt-3">Previous Hash</p>
-                        <p className="text-xs font-mono mt-1 break-all">{shortHash(entry.prevHash, 10, 6)}</p>
-                        <p className="text-xs text-slate-400 mt-3">Current Hash</p>
-                        <p className="text-xs font-mono mt-1 break-all">{shortHash(entry.hash, 10, 6)}</p>
+                      <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs space-y-1 font-mono text-slate-600 border border-slate-100">
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">EVENT ID:</span>
+                          <span>AUD-{String(entry.id).padStart(5, '0')}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-400">PREV HASH:</span>
+                          <TruncatedHash value={entry.prevHash} start={10} end={6} />
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-slate-400">HASH:</span>
+                          <TruncatedHash value={entry.hash} start={10} end={6} />
+                        </div>
                       </div>
 
-                      <details className="mt-3">
-                        <summary className="cursor-pointer text-xs font-semibold text-slate-500">Event details</summary>
-                        <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[10px] text-slate-100">
-                          {prettyJson(typeof entry.payload === 'string' ? safeParse(entry.payload) : entry.payload)}
-                        </pre>
+                      <details className="mt-2.5">
+                        <summary className="cursor-pointer text-sm font-semibold text-slate-500 hover:text-slate-700">
+                          Event details
+                        </summary>
+                        <div className="mt-2">
+                          <KeyValueDisplay
+                            data={
+                              typeof entry.payload === 'string'
+                                ? (safeParse(entry.payload) as Record<string, unknown>)
+                                : (entry.payload as Record<string, unknown>)
+                            }
+                          />
+                        </div>
                       </details>
                     </div>
                   </div>
-                </div>
+                </Card>
               );
             })}
           </div>
@@ -1557,6 +2213,10 @@ function safeParse(text: string): unknown {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* settings                                                           */
+/* ------------------------------------------------------------------ */
+
 function SettingsScreen({
   name,
   email,
@@ -1569,30 +2229,51 @@ function SettingsScreen({
   onLogout: () => void;
 }) {
   return (
-    <div>
-      <PageTitle title="Settings" subtitle="Manage your LifeLink wallet." />
+    <div className="space-y-6">
+      <PageHeader
+        title="Settings"
+        subtitle="Manage your GitLink wallet parameters and session."
+      />
 
-      <div className="bg-white rounded-2xl p-6 mt-8 shadow-sm border max-w-2xl">
-        <h3 className="text-xl font-bold">Wallet Information</h3>
-        <div className="mt-5 space-y-4">
-          <Detail label="NAME" value={name} />
-          {email && <Detail label="EMAIL" value={email} />}
-          <Detail label="WALLET ID (DID)" value={did || '—'} mono />
-          <Detail label="API" value={API_BASE} mono />
-        </div>
-      </div>
-
-      <div className="bg-white rounded-2xl p-6 mt-5 shadow-sm border max-w-2xl">
-        <div className="flex justify-between items-center gap-4">
-          <div>
-            <h3 className="text-xl font-bold">Session</h3>
-            <p className="text-sm text-slate-500 mt-1">Log out of this wallet on this device.</p>
+      <Card className="max-w-2xl">
+        <CardHeader>
+          <CardTitle>Wallet Identity Information</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4 pt-1">
+          <div className="flex justify-between py-2 border-b border-slate-100 text-sm">
+            <span className="text-slate-500 font-medium">Name</span>
+            <span className="font-semibold text-slate-900">{name}</span>
           </div>
-          <button type="button" onClick={onLogout} className={BTN_PRIMARY}>
-            Log out
-          </button>
-        </div>
-      </div>
+          {email && (
+            <div className="flex justify-between py-2 border-b border-slate-100 text-sm">
+              <span className="text-slate-500 font-medium">Email</span>
+              <span className="font-semibold text-slate-900 font-mono text-xs">{email}</span>
+            </div>
+          )}
+          <div className="flex justify-between py-2 border-b border-slate-100 text-sm items-center">
+            <span className="text-slate-500 font-medium">Wallet DID</span>
+            <TruncatedHash value={did} start={14} end={8} />
+          </div>
+          <div className="flex justify-between py-2 text-sm items-center">
+            <span className="text-slate-500 font-medium">API Endpoint</span>
+            <span className="font-mono text-xs text-slate-700">{API_BASE}</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="max-w-2xl">
+        <CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-2">
+          <div>
+            <h3 className="text-base font-bold text-slate-900">Current Session</h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Log out of your GitLink wallet on this browser session.
+            </p>
+          </div>
+          <Button variant="danger-outline" size="sm" onClick={onLogout}>
+            Log Out of Wallet
+          </Button>
+        </CardContent>
+      </Card>
     </div>
   );
 }

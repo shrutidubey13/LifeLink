@@ -1,4 +1,4 @@
--- LifeLink PostgreSQL schema
+-- GitLink PostgreSQL schema
 -- Run with: psql $DATABASE_URL -f schema.sql
 
 CREATE TABLE IF NOT EXISTS citizens (
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS verifiers (
 -- get NULL until the seed script or registration backfills them).
 ALTER TABLE citizens ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;
 ALTER TABLE citizens ADD COLUMN IF NOT EXISTS password_hash TEXT;
--- Custodial holder key for the demo wallet (AES-GCM envelope JSON, KeyStore).
+-- Custodial holder key for the wallet (AES-GCM envelope JSON, KeyStore).
 -- Production wallets keep this key on-device; see README.
 ALTER TABLE citizens ADD COLUMN IF NOT EXISTS private_jwk_enc TEXT;
 ALTER TABLE verifiers ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;
@@ -209,3 +209,23 @@ CREATE TABLE IF NOT EXISTS document_requests (
 CREATE INDEX IF NOT EXISTS idx_document_requests_citizen ON document_requests(citizen_id);
 CREATE INDEX IF NOT EXISTS idx_document_requests_org ON document_requests(organization_id);
 CREATE INDEX IF NOT EXISTS idx_document_requests_status ON document_requests(status);
+
+-- Encrypted document files at rest (AES-256-GCM envelope bytes)
+CREATE TABLE IF NOT EXISTS document_files (
+  id SERIAL PRIMARY KEY,
+  owner INTEGER NOT NULL REFERENCES citizens(id) ON DELETE CASCADE,
+  file_name TEXT NOT NULL DEFAULT 'document.pdf',
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  encrypted_bytes BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_files_owner ON document_files(owner);
+
+ALTER TABLE document_requests ADD COLUMN IF NOT EXISTS file_id INTEGER REFERENCES document_files(id) ON DELETE SET NULL;
+ALTER TABLE credentials ADD COLUMN IF NOT EXISTS attachment_id INTEGER REFERENCES document_files(id) ON DELETE SET NULL;
+ALTER TABLE consents ADD COLUMN IF NOT EXISTS share_attachment BOOLEAN NOT NULL DEFAULT FALSE;
+
+

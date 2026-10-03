@@ -24,8 +24,8 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
-/** The demo can stash a share here so the verifier portal auto-fills after an account switch. */
-const LAST_SHARE_KEY = 'lifelink_last_share';
+/** Stash a share here so the verifier portal auto-fills after an account switch. */
+const LAST_SHARE_KEY = 'gitlink_last_share';
 
 export function stashShare(payload: { presentation: string }): void {
   try {

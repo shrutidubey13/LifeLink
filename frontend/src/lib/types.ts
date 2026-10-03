@@ -47,6 +47,14 @@ export interface Verifier {
   hasLogin: boolean;
 }
 
+export interface DocumentFile {
+  id: number;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+}
+
 export interface Credential {
   id: number;
   type: string;
@@ -59,6 +67,8 @@ export interface Credential {
   vc?: unknown | null;
   claims: Record<string, unknown>;
   availableFields: string[];
+  attachmentId?: number | null;
+  attachment?: DocumentFile | null;
 }
 
 export interface WalletResponse {
@@ -77,6 +87,7 @@ export interface Consent {
   purpose: string;
   requestedFields?: string[];
   fields: string[];
+  shareAttachment?: boolean;
   status?: string;
   state: ConsentState;
   presentationRequestId?: number | null;
@@ -124,10 +135,13 @@ export interface DocumentRequest {
   status: DocumentStatus;
   rejectionReason: string | null;
   credentialId: number | null;
+  fileId?: number | null;
+  file?: DocumentFile | null;
   createdAt: string;
   reviewedAt: string | null;
   reviewer: string | null;
 }
+
 
 /** What POST /wallet/presentations returns right after the citizen approves. */
 export interface ShareResult {
@@ -177,9 +191,11 @@ export interface VerifyResponse {
     issuer: Issuer | null;
     subject: string | null;
     statusIndex: number;
+    attachmentId?: number | null;
   } | null;
+  attachment?: DocumentFile | null;
   comparison?: {
-    lifelink: { verificationTimeMs: number; documentsUploaded: number; formsFilled: number; summary: string };
+    gitlink: { verificationTimeMs: number; documentsUploaded: number; formsFilled: number; summary: string };
     traditional: { verificationTime: string; documentsUploaded: number; formsFilled: number; summary: string };
   };
   verifiedAt: string;
@@ -200,8 +216,10 @@ export type AuditEventType =
   | 'CREDENTIAL_SHARED'
   | 'CREDENTIAL_VERIFIED'
   | 'VERIFICATION_FAILED'
+  | 'ATTACHMENT_VIEWED'
   | 'CREDENTIAL_REVOKED'
   | 'TRUST_REGISTRY_UPDATED';
+
 
 export interface AuditEntry {
   id: number;

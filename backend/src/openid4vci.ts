@@ -64,7 +64,7 @@ export function buildIssuerMetadata(args: {
   for (const type of CREDENTIAL_TYPES) {
     configurations[type] = {
       format: 'vc+sd-jwt',
-      scope: `lifelink:${type}`,
+      scope: `gitlink:${type}`,
       credential_definition: { type: ['VerifiableCredential', type] },
       proof_types_supported: {},
     };
@@ -97,7 +97,7 @@ export async function createCredentialOffer(args: {
   return {
     code,
     offer: {
-      credential_issuer: 'lifelink',
+      credential_issuer: 'gitlink',
       credential_configuration_ids: [args.type],
       grants: {
         'urn:ietf:params:oauth:grant-type:pre-authorized_code': { 'pre-authorized_code': code },

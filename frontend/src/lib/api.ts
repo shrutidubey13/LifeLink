@@ -33,12 +33,12 @@ import type {
   WalletResponse,
 } from './types';
 
-export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000').replace(/\/$/, '');
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
 
-const TOKEN_KEY = 'lifelink_token';
+const TOKEN_KEY = 'gitlink_token';
 
 /** Fired when the server rejects our token — the session listens and logs out. */
-export const UNAUTHORIZED_EVENT = 'lifelink:unauthorized';
+export const UNAUTHORIZED_EVENT = 'gitlink:unauthorized';
 
 export function getStoredToken(): string | null {
   try {
@@ -72,11 +72,12 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getStoredToken();
   let response: Response;
+  const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData;
   try {
     response = await fetch(`${API_BASE}${path}`, {
       ...init,
       headers: {
-        'content-type': 'application/json',
+        ...(isFormData ? {} : { 'content-type': 'application/json' }),
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(init?.headers ?? {}),
       },
@@ -84,7 +85,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     throw new ApiError(
       0,
-      `Cannot reach the LifeLink API at ${API_BASE}. Is the backend running (npm run dev in /backend)?`,
+      `Cannot reach the GitLink API at ${API_BASE}. Is the backend running (npm run dev in /backend)?`,
     );
   }
 
@@ -115,6 +116,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const get = <T>(path: string) => request<T>(path);
 const post = <T>(path: string, body: unknown) =>
   request<T>(path, { method: 'POST', body: JSON.stringify(body ?? {}) });
+const postForm = <T>(path: string, formData: FormData) =>
+  request<T>(path, { method: 'POST', body: formData });
+
 
 export const api = {
   health: () => get<{ status: string; time: string }>('/health'),
@@ -169,14 +173,19 @@ export const api = {
     post<{ message: string; alreadyRevoked: boolean }>(`/issuer/credentials/${id}/revoke`, {}),
 
   // document verification flow (Flow B)
-  submitDocument: (input: {
-    documentType: string;
+  submitDocument: (input: FormData | {
+    documentType?: string;
     documentName: string;
-    documentRef: string;
+    documentRef?: string;
     mimeType?: string;
     organizationId: number;
-    purpose: string;
-  }) => post<{ document: DocumentRequest; message: string }>('/wallet/documents', input),
+    purpose?: string;
+  }) => {
+    if (input instanceof FormData) {
+      return postForm<{ document: DocumentRequest; message: string }>('/wallet/documents', input);
+    }
+    return post<{ document: DocumentRequest; message: string }>('/wallet/documents', input);
+  },
   myDocuments: () => get<{ documents: DocumentRequest[] }>('/wallet/documents'),
   orgDocuments: (status?: string) =>
     get<{ documents: DocumentRequest[] }>(
@@ -192,10 +201,32 @@ export const api = {
   rejectDocument: (id: number, reason: string) =>
     post<{ document: DocumentRequest; message: string }>(`/organization/documents/${id}/reject`, { reason }),
 
+  // File and attachment endpoints
+  documentFileUrl: (id: number) => `${API_BASE}/organization/documents/${id}/file`,
+  walletDocumentFileUrl: (id: number) => `${API_BASE}/wallet/documents/${id}/file`,
+  verifierAttachmentUrl: (attachmentId: number) => `${API_BASE}/verifier/attachments/${attachmentId}`,
+  walletAttachmentUrl: (attachmentId: number) => `${API_BASE}/wallet/attachments/${attachmentId}`,
+  fetchFileBlob: async (url: string): Promise<{ blob: Blob; mime: string; name: string }> => {
+    const token = getStoredToken();
+    const res = await fetch(url, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `Failed to fetch file (HTTP ${res.status})` }));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const mime = res.headers.get('content-type') || 'application/octet-stream';
+    const cd = res.headers.get('content-disposition') || '';
+    const match = /filename="([^"]+)"/.exec(cd);
+    const name = match ? match[1] : 'document';
+    return { blob, mime, name };
+  },
+
   // wallet (identity from JWT; no citizenId query params)
   wallet: () => get<WalletResponse>('/wallet/credentials'),
   walletRequests: () => get<{ requests: PresentationRequest[] }>('/wallet/requests'),
-  approveRequest: (id: number, input: { credentialId: number; fields: string[] }) =>
+  approveRequest: (id: number, input: { credentialId: number; fields: string[]; shareAttachment?: boolean }) =>
     post<ShareResult>(`/wallet/requests/${id}/approve`, input),
   rejectRequest: (id: number) => post<{ consent: Consent }>(`/wallet/requests/${id}/reject`, {}),
   consents: () => get<{ consents: Consent[] }>('/wallet/consents'),
@@ -207,6 +238,7 @@ export const api = {
     purpose: string;
     fields: string[];
     duration: string;
+    shareAttachment?: boolean;
   }) => {
     // Citizen-initiated share targets a legacy verifier id. When the UI picks
     // an ORGANIZATION, resolve via organizations list is unnecessary: the
@@ -223,10 +255,12 @@ export const api = {
       purpose: input.purpose,
       fields: input.fields,
       duration: input.duration,
+      shareAttachment: input.shareAttachment,
     });
   },
   endConsent: (consentId: number) =>
     post<{ message?: string; consent: Consent }>(`/wallet/consents/${consentId}/revoke`, {}),
+
 
   // verifier (legacy) — presentation only, request resolved server-side
   verify: (presentation: string) => post<VerifyResponse>('/verifier/verify', { presentation }),

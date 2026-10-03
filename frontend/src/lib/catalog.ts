@@ -53,32 +53,38 @@ export const STAGES: Stage[] = [
   },
 ];
 
-/** Example claims offered by the issuer portal when you pick a type. Must match backend/schemas.ts exactly. */
 export const EXAMPLE_CLAIMS: Record<string, Record<string, unknown>> = {
+  DocumentCredential: {
+    documentName: 'Bachelor of Computer Applications',
+    category: 'Education',
+    holderName: 'Aarav Sharma',
+    issuedDate: '2026-05-15',
+    description: 'Undergraduate degree with first class distinction',
+  },
   DegreeCredential: {
-    name: 'Demo Student',
+    name: 'Aarav Sharma',
     degree: 'BCA Computer Applications',
-    university: 'ABC University',
+    university: 'XIE University',
     graduationYear: 2026,
     fieldOfStudy: 'Computer Applications',
-    studentId: 'LL-2026-0001',
+    studentId: 'GL-2026-0001',
   },
   EmploymentCredential: {
     employmentStatus: 'employed',
-    employer: 'XYZ Company',
+    employer: 'TechNova Pvt Ltd',
     jobTitle: 'Software Engineer',
     joiningDate: '2025-08-01',
     employeeId: 'EMP-4471',
   },
   BankCustomerCredential: {
-    customerName: 'Demo Student',
+    customerName: 'Aarav Sharma',
     accountType: 'Savings',
     kycStatus: 'verified',
     aadhaarLast4: '4821',
     panMasked: 'ABCDE****K',
   },
   HealthCredential: {
-    fullName: 'Demo Student',
+    fullName: 'Aarav Sharma',
     bloodGroup: 'O+',
     fitnessStatus: 'fit',
     insuranceId: 'INS-88213',
@@ -87,6 +93,7 @@ export const EXAMPLE_CLAIMS: Record<string, Record<string, unknown>> = {
 
 /** Extra types the issuer portal offers. */
 export const EXTRA_TYPES: Record<string, Record<string, unknown>> = {};
+
 
 /**
  * Friendly labels. Anything not listed is prettified automatically
@@ -161,19 +168,11 @@ export function typeLabel(type: string): string {
   return type.replace(/Credential$/, '');
 }
 
-/** The four types offered in the issuer portal, plus extras. */
-export const ISSUER_TYPES: string[] = [...Object.keys(EXAMPLE_CLAIMS), ...Object.keys(EXTRA_TYPES)];
-
-/** Document types citizens can submit, mapped to eligible org types. */
-export const DOCUMENT_TYPES: { value: string; label: string; hint: string }[] = [
-  { value: 'Degree', label: 'Degree / Marksheet', hint: 'Verified by a University/College' },
-  { value: 'Employment', label: 'Employment / Offer letter', hint: 'Verified by an Employer' },
-  { value: 'KYC', label: 'KYC / Bank document', hint: 'Verified by a Bank' },
-  { value: 'Health', label: 'Health / Fitness record', hint: 'Verified by a Hospital' },
-];
+/** Generic DocumentCredential is the standard issuance type. */
+export const ISSUER_TYPES: string[] = ['DocumentCredential'];
 
 export function exampleClaimsFor(type: string): Record<string, unknown> {
-  return EXAMPLE_CLAIMS[type] ?? EXTRA_TYPES[type] ?? { full_name: 'Demo Student' };
+  return EXAMPLE_CLAIMS[type] ?? EXAMPLE_CLAIMS.DocumentCredential;
 }
 
 /** Consent durations, matching the backend's DURATIONS map. */
@@ -187,19 +186,20 @@ export function durationLabel(value: string): string {
   return DURATIONS.find((d) => d.value === value)?.label ?? value;
 }
 
-/** Purpose suggestions, so a demo never has to invent one. */
+/** Purpose suggestions for requests. */
 export const PURPOSE_SUGGESTIONS = [
   'Open a bank account (KYC)',
-  'Prove I am currently employed',
-  'Occupational health check for a new role',
-  'Rent an apartment',
-  'Apply for a loan',
+  'Prove academic qualifications for employment',
+  'Prove current employment and salary',
+  'Health and medical fitness verification',
+  'Rental lease or mortgage application',
+  'Loan eligibility check',
 ];
 
 /** Colour + label for each audit event type. */
 export const EVENT_STYLES: Record<string, { label: string; className: string }> = {
-  CREDENTIAL_ISSUED: { label: 'Credential issued', className: 'bg-indigo-50 text-indigo-700' },
-  CREDENTIAL_RECEIVED: { label: 'Credential received', className: 'bg-indigo-50 text-indigo-700' },
+  CREDENTIAL_ISSUED: { label: 'Document issued', className: 'bg-indigo-50 text-indigo-700' },
+  CREDENTIAL_RECEIVED: { label: 'Document received', className: 'bg-indigo-50 text-indigo-700' },
   DOCUMENT_SUBMITTED: { label: 'Document submitted', className: 'bg-sky-50 text-sky-700' },
   DOCUMENT_APPROVED: { label: 'Document approved', className: 'bg-emerald-50 text-emerald-700' },
   DOCUMENT_REJECTED: { label: 'Document rejected', className: 'bg-rose-50 text-rose-700' },
@@ -208,16 +208,18 @@ export const EVENT_STYLES: Record<string, { label: string; className: string }> 
   CONSENT_REJECTED: { label: 'Consent ended', className: 'bg-slate-100 text-slate-700' },
   CONSENT_DENIED: { label: 'Consent denied', className: 'bg-slate-100 text-slate-700' },
   CONSENT_REVOKED: { label: 'Consent ended', className: 'bg-slate-100 text-slate-700' },
-  CREDENTIAL_PRESENTED: { label: 'Credential shared', className: 'bg-sky-50 text-sky-700' },
-  CREDENTIAL_SHARED: { label: 'Credential shared', className: 'bg-sky-50 text-sky-700' },
+  CREDENTIAL_PRESENTED: { label: 'Document shared', className: 'bg-sky-50 text-sky-700' },
+  CREDENTIAL_SHARED: { label: 'Document shared', className: 'bg-sky-50 text-sky-700' },
   CREDENTIAL_VERIFIED: { label: 'Verification granted', className: 'bg-emerald-50 text-emerald-700' },
   VERIFICATION_FAILED: { label: 'Verification denied', className: 'bg-rose-50 text-rose-700' },
-  CREDENTIAL_REVOKED: { label: 'Credential revoked', className: 'bg-rose-50 text-rose-700' },
+  ATTACHMENT_VIEWED: { label: 'Attachment viewed', className: 'bg-purple-50 text-purple-700' },
+  CREDENTIAL_REVOKED: { label: 'Document revoked', className: 'bg-rose-50 text-rose-700' },
   TRUST_REGISTRY_UPDATED: { label: 'Trust registry changed', className: 'bg-amber-50 text-amber-700' },
-  // Legacy aliases (old frontend vocabulary)
-  ISSUER_CREDENTIAL_ISSUED: { label: 'Credential issued', className: 'bg-indigo-50 text-indigo-700' },
-  ISSUER_CREDENTIAL_REVOKED: { label: 'Credential revoked', className: 'bg-rose-50 text-rose-700' },
+  // Legacy aliases
+  ISSUER_CREDENTIAL_ISSUED: { label: 'Document issued', className: 'bg-indigo-50 text-indigo-700' },
+  ISSUER_CREDENTIAL_REVOKED: { label: 'Document revoked', className: 'bg-rose-50 text-rose-700' },
   CONSENT_GRANTED: { label: 'Consent granted', className: 'bg-sky-50 text-sky-700' },
   VERIFICATION_GRANTED: { label: 'Verification granted', className: 'bg-emerald-50 text-emerald-700' },
   VERIFICATION_DENIED: { label: 'Verification denied', className: 'bg-rose-50 text-rose-700' },
 };
+

@@ -1,5 +1,5 @@
 /**
- * LifeLink REST API.
+ * GitLink REST API.
  *
  * Section map:
  *   1. helpers + DTO mappers (zod validation, email-visibility rules)
@@ -23,7 +23,8 @@
  */
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
-import type { JWK } from 'jose';import { HttpError, config } from './config';
+import type { JWK } from 'jose';
+import { HttpError, config } from './config';
 import { query, queryOne } from './db';
 import { appendAuditEvent, verifyAuditChain } from './audit';
 import { getStatusListRow, getStatusListView, allocateStatusIndex, isRevoked, revokeStatusIndex } from './statusList';
@@ -38,7 +39,15 @@ import {
 } from './sdjwt';
 import { decodeJwt } from 'jose';
 import { didKeyFromPublicJwk, didWeb, generateEd25519KeyPair, resolveDidKey } from './crypto';
-import { encryptPrivateJwk, getHolderSigningKey, getIssuerSigningKey } from './keystore';
+import {
+  decryptFileBytes,
+  encryptFileBytes,
+  encryptPrivateJwk,
+  getHolderSigningKey,
+  getIssuerSigningKey,
+} from './keystore';
+import multer from 'multer';
+import crypto from 'node:crypto';
 import {
   CREDENTIAL_TYPES,
   isCredentialType,
@@ -92,6 +101,7 @@ import type {
   ConsentRow,
   CredentialRow,
   CredentialStatus,
+  DocumentFileRow,
   DocumentRequestRow,
   IssuerRow,
   IssuerStatus,
@@ -99,6 +109,34 @@ import type {
 } from './types';
 
 export const router: Router = Router();
+
+const upload = multer({
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB limit
+  storage: multer.memoryStorage(),
+});
+
+function detectMimeAndValidate(buffer: Buffer): { mime: string; ext: string } {
+  if (buffer.length >= 4 && buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46) {
+    return { mime: 'application/pdf', ext: 'pdf' };
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return { mime: 'image/png', ext: 'png' };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mime: 'image/jpeg', ext: 'jpeg' };
+  }
+  throw new HttpError(400, 'Invalid file format. Only PDF, PNG, and JPEG files are permitted (magic bytes validation failed).');
+}
 
 /* ------------------------------------------------------------------ */
 /* 1. helpers                                                          */
@@ -205,8 +243,14 @@ async function loadConsentByRequest(requestId: number): Promise<ConsentRow | nul
   return queryOne<ConsentRow>('SELECT * FROM consents WHERE presentation_request_id = $1', [requestId]);
 }
 
-async function loadDocumentRequest(id: number): Promise<DocumentRequestRow> {
-  const row = await queryOne<DocumentRequestRow>('SELECT * FROM document_requests WHERE id = $1', [id]);
+async function loadDocumentRequest(id: number): Promise<DocumentRequestRow & { file_name?: string; file_mime?: string; file_size?: number; file_sha256?: string }> {
+  const row = await queryOne<DocumentRequestRow & { file_name?: string; file_mime?: string; file_size?: number; file_sha256?: string }>(
+    `SELECT dr.*, df.file_name, df.mime AS file_mime, df.size AS file_size, df.sha256 AS file_sha256
+     FROM document_requests dr
+     LEFT JOIN document_files df ON df.id = dr.file_id
+     WHERE dr.id = $1`,
+    [id],
+  );
   if (!row) throw new HttpError(404, `Document request ${id} not found`);
   return row;
 }
@@ -245,10 +289,10 @@ function requireVerifyCapability(row: IssuerRow): void {
 async function ensureLinkedVerifier(issuer: IssuerRow): Promise<VerifierRow> {
   const existing = await queryOne<VerifierRow>('SELECT * FROM verifiers WHERE did = $1', [issuer.did]);
   if (existing) return existing;
-  const email = issuer.email ?? `org-${issuer.id}@lifelink.local`;
+  const email = issuer.email ?? `org-${issuer.id}@gitlink.local`;
   // Email must be unique in verifiers; fall back with suffix on clash.
   const clash = await queryOne<VerifierRow>('SELECT id FROM verifiers WHERE email = $1', [email]);
-  const finalEmail = clash ? `org-${issuer.id}-${Date.now()}@lifelink.local` : email;
+  const finalEmail = clash ? `org-${issuer.id}-${Date.now()}@gitlink.local` : email;
   const created = await queryOne<VerifierRow>(
     'INSERT INTO verifiers (name, did, email) VALUES ($1, $2, $3) RETURNING *',
     [issuer.name, issuer.did, finalEmail],
@@ -270,7 +314,12 @@ async function actingVerifier(auth: { kind: AccountKind; id: number }): Promise<
 }
 
 function documentDto(
-  row: DocumentRequestRow,
+  row: DocumentRequestRow & {
+    file_name?: string;
+    file_mime?: string;
+    file_size?: number;
+    file_sha256?: string;
+  },
   citizen: CitizenRow | null,
   organization: IssuerRow | null,
 ) {
@@ -283,11 +332,21 @@ function documentDto(
     documentType: row.document_type,
     documentName: row.document_name,
     documentRef: row.document_ref,
-    mimeType: row.mime_type,
+    mimeType: row.file_mime ?? row.mime_type,
     purpose: row.purpose,
     status: row.status,
     rejectionReason: row.rejection_reason,
     credentialId: row.credential_id,
+    fileId: row.file_id ?? null,
+    file: row.file_id
+      ? {
+          id: row.file_id,
+          name: row.file_name ?? row.document_name,
+          mime: row.file_mime ?? row.mime_type,
+          size: row.file_size ?? 0,
+          sha256: row.file_sha256 ?? '',
+        }
+      : null,
     createdAt: row.created_at.toISOString(),
     reviewedAt: row.reviewed_at ? row.reviewed_at.toISOString() : null,
     reviewer: row.reviewer,
@@ -378,7 +437,12 @@ function credentialStatus(row: CredentialRow, now = new Date()): CredentialStatu
 }
 
 function credentialDto(
-  row: CredentialRow,
+  row: CredentialRow & {
+    attachment_name?: string;
+    attachment_mime?: string;
+    attachment_size?: number;
+    attachment_sha256?: string;
+  },
   issuer: IssuerRow,
   claims: Record<string, unknown>,
   viewer: { kind: AccountKind; id: number } | null = null,
@@ -398,6 +462,16 @@ function credentialDto(
     claims,
     /** Names the citizen can tick when sharing. */
     availableFields: Object.keys(claims),
+    attachmentId: row.attachment_id ?? null,
+    attachment: row.attachment_id
+      ? {
+          id: row.attachment_id,
+          name: row.attachment_name ?? (typeof claims.documentName === 'string' ? claims.documentName : 'Attached Document'),
+          mime: row.attachment_mime ?? 'application/pdf',
+          size: row.attachment_size ?? 0,
+          sha256: row.attachment_sha256 ?? '',
+        }
+      : null,
   };
 }
 
@@ -426,6 +500,7 @@ function consentDto(row: ConsentRow, verifier: VerifierRow | null, credential: C
     requestedFields: row.requested_fields ?? row.fields,
     /** Fields the citizen approved (subset of requested). */
     fields: row.fields,
+    shareAttachment: Boolean(row.share_attachment),
     status: row.status ?? 'APPROVED',
     state: consentState(row),
     presentationRequestId: row.presentation_request_id,
@@ -435,6 +510,7 @@ function consentDto(row: ConsentRow, verifier: VerifierRow | null, credential: C
     createdAt: row.created_at.toISOString(),
   };
 }
+
 
 function requestDto(
   row: PresentationRequestRow,
@@ -524,7 +600,8 @@ const credentialRequestBody = z
 const verifierRequestBody = z
   .object({
     citizenId: z.number().int().positive(),
-    credentialType: credentialTypeEnum,
+    credentialType: z.string().default('DocumentCredential').transform((val) => (isCredentialType(val) ? val : 'DocumentCredential')),
+    documentName: z.string().optional(),
     requestedFields: z.array(z.string().min(1).max(100)).min(1).max(50),
     purpose: z.string().trim().min(3).max(300),
     ttlMinutes: z.number().int().min(5).max(1440).default(30),
@@ -535,6 +612,7 @@ const approveBody = z
   .object({
     credentialId: z.number().int().positive(),
     fields: z.array(z.string().min(1).max(100)).min(1).max(50),
+    shareAttachment: z.boolean().default(false),
   })
   .strict();
 
@@ -545,6 +623,7 @@ const directShareBody = z
     purpose: z.string().trim().min(3).max(300),
     fields: z.array(z.string().min(1).max(100)).min(1).max(50),
     duration: z.enum(['5m', '30m', '1d']).default('30m'),
+    shareAttachment: z.boolean().default(false),
   })
   .strict();
 
@@ -578,14 +657,14 @@ const adminCreateIssuerBody = z
 
 const documentSubmitBody = z
   .object({
-    documentType: z.string().trim().min(2).max(100),
+    documentType: z.string().trim().min(2).max(100).default('DocumentCredential'),
     documentName: z.string().trim().min(1).max(300),
-    documentRef: z.string().trim().min(1).max(20000),
-    mimeType: z.string().trim().min(1).max(100).default('application/pdf'),
-    organizationId: z.number().int().positive(),
-    purpose: z.string().trim().min(3).max(500),
-  })
-  .strict();
+    documentRef: z.string().trim().max(20000).optional(),
+    mimeType: z.string().trim().min(1).max(100).optional(),
+    organizationId: z.coerce.number().int().positive(),
+    purpose: z.string().trim().max(500).default(''),
+  });
+
 
 const documentApproveBody = z
   .object({
@@ -632,11 +711,30 @@ async function issueCredentialCore(args: {
   type: CredentialType;
   rawClaims: unknown;
   expiresInDays: number;
+  attachmentId?: number | null;
 }): Promise<IssuedRecord> {
   requireTrustedIssuer(args.issuer, 'sign credentials');
   requireIssueCapability(args.issuer);
 
-  const checked = validateClaims(args.type, args.rawClaims);
+  let claimsToValidate = args.rawClaims;
+  if (args.type === 'DocumentCredential' && typeof claimsToValidate === 'object' && claimsToValidate !== null) {
+    const c = { ...(claimsToValidate as Record<string, unknown>) };
+    const standardKeys = new Set(['documentName', 'category', 'description', 'holderName', 'issuedDate', 'extraFields', 'attachmentId']);
+    const extra: Record<string, string> =
+      typeof c.extraFields === 'object' && c.extraFields !== null ? { ...(c.extraFields as Record<string, string>) } : {};
+    for (const [k, v] of Object.entries(c)) {
+      if (!standardKeys.has(k)) {
+        extra[k] = typeof v === 'string' ? v : String(v);
+        delete c[k];
+      }
+    }
+    if (Object.keys(extra).length > 0) {
+      c.extraFields = extra;
+    }
+    claimsToValidate = c;
+  }
+
+  const checked = validateClaims(args.type, claimsToValidate);
   if (!checked.ok || !checked.claims) {
     throw new HttpError(400, `Claims do not match the ${args.type} schema`, checked.issues);
   }
@@ -646,7 +744,7 @@ async function issueCredentialCore(args: {
   const issuedAt = new Date();
   const expiresAt = new Date(Date.now() + args.expiresInDays * 24 * 60 * 60 * 1000);
   const vc = buildVc({
-    id: `urn:lifelink:credential:${args.issuer.id}:${statusIndex}`,
+    id: `urn:gitlink:credential:${args.issuer.id}:${statusIndex}`,
     issuerDid: args.issuer.did,
     subjectDid: args.citizen.did,
     type: args.type,
@@ -677,8 +775,8 @@ async function issueCredentialCore(args: {
 
   const inserted = await queryOne<CredentialRow>(
     `INSERT INTO credentials
-       (citizen_id, issuer_id, type, sd_jwt, jwt, vc_json, status_index, revoked, issued_at, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9)
+       (citizen_id, issuer_id, type, sd_jwt, jwt, vc_json, status_index, revoked, issued_at, expires_at, attachment_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10)
      RETURNING *`,
     [
       args.citizen.id,
@@ -690,6 +788,7 @@ async function issueCredentialCore(args: {
       statusIndex,
       issuedAt,
       expiresAt,
+      args.attachmentId ?? null,
     ],
   );
   const credential = inserted as CredentialRow;
@@ -707,6 +806,7 @@ async function issueCredentialCore(args: {
       vcId: vc.id,
       statusIndex,
       expiresAt: expiresAt.toISOString(),
+      attachmentId: args.attachmentId ?? null,
       // Claim NAMES only — never the values (DPDP data minimisation).
       claimKeys: Object.keys(checked.claims),
       standard: 'W3C VC 2.0 + RFC 9901 SD-JWT (sha-256)',
@@ -717,7 +817,7 @@ async function issueCredentialCore(args: {
 }
 
 /**
- * Build an SD-JWT+KB presentation server-side (custodial demo wallet) and
+ * Build an SD-JWT+KB presentation server-side (custodial wallet) and
  * return it. The holder key NEVER leaves the KeyStore — only the signature
  * travels, inside the KB-JWT.
  */
@@ -755,7 +855,7 @@ router.get(
     const db = await queryOne<{ now: Date }>('SELECT NOW() AS now');
     res.json({
       status: 'ok',
-      service: 'lifelink-backend',
+      service: 'gitlink-backend',
       time: db?.now.toISOString() ?? new Date().toISOString(),
     });
   }),
@@ -945,7 +1045,7 @@ router.post(
   }),
 );
 
-/** Admins log in (the seed creates the demo admin; no public registration). */
+/** Admins log in (the seed creates the admin; no public registration). */
 router.post(
   '/auth/admin/login',
   route(async (req, res) => {
@@ -1154,7 +1254,7 @@ router.post(
     res.status(201).json({
       ...offer,
       // Delivered to the wallet out-of-band in production; returned here so
-      // the hackathon demo can redeem it in one screen.
+      // the wallet can redeem it directly.
       pre_authorized_code: code,
       credential_configuration_id: input.type,
     });
@@ -1235,19 +1335,27 @@ router.get(
         issuer_org_type: string | null;
         issuer_can_issue: boolean;
         issuer_can_verify: boolean;
+        attachment_name?: string;
+        attachment_mime?: string;
+        attachment_size?: number;
+        attachment_sha256?: string;
       }
     >(
       `SELECT c.*, i.name AS issuer_name, i.domain AS issuer_domain, i.did AS issuer_did,
               i.status AS issuer_status, i.trusted AS issuer_trusted,
               i.public_jwk AS issuer_public_jwk,
               i.org_type AS issuer_org_type,
-              i.can_issue AS issuer_can_issue, i.can_verify AS issuer_can_verify
+              i.can_issue AS issuer_can_issue, i.can_verify AS issuer_can_verify,
+              df.file_name AS attachment_name, df.mime AS attachment_mime,
+              df.size AS attachment_size, df.sha256 AS attachment_sha256
        FROM credentials c
        JOIN issuers i ON i.id = c.issuer_id
+       LEFT JOIN document_files df ON df.id = c.attachment_id
        WHERE c.citizen_id = $1
        ORDER BY c.issued_at DESC, c.id DESC`,
       [citizen.id],
     );
+
 
     const credentials = result.rows.map((row) => {
       // Rebuild just enough of the issuer row for the DTO. Only the PUBLIC key
@@ -1378,30 +1486,33 @@ router.post(
 
     const approvedFields = Array.from(new Set(input.fields));
     const existingConsent = await loadConsentByRequest(request.id);
-    const consent = (await queryOne<ConsentRow>(
-      existingConsent
-        ? `UPDATE consents SET credential_id = $1, fields = $2, status = 'APPROVED',
-             presentation = $3, expires_at = $4 WHERE id = $5 RETURNING *`
-        : `INSERT INTO consents
+    const consent = existingConsent
+      ? ((await queryOne<ConsentRow>(
+          `UPDATE consents
+           SET credential_id = $1, fields = $2, status = 'APPROVED',
+               presentation = $3, expires_at = $4, share_attachment = $5
+           WHERE id = $6 RETURNING *`,
+          [credential.id, approvedFields, presentation, request.expires_at, Boolean(input.shareAttachment), existingConsent.id],
+        )) as ConsentRow)
+      : ((await queryOne<ConsentRow>(
+          `INSERT INTO consents
              (citizen_id, verifier_id, credential_id, purpose, fields, requested_fields,
-              status, presentation_request_id, presentation, expires_at, revoked)
-           VALUES ($6, $7, $1, $8, $2, $9, 'APPROVED', $10, $3, $4, FALSE)
+              status, presentation_request_id, presentation, expires_at, share_attachment, revoked)
+           VALUES ($1, $2, $3, $4, $5, $6, 'APPROVED', $7, $8, $9, $10, FALSE)
            RETURNING *`,
-      existingConsent
-        ? [credential.id, approvedFields, presentation, request.expires_at, existingConsent.id]
-        : [
-            credential.id,
-            approvedFields,
-            presentation,
-            request.expires_at,
-            null,
+          [
             citizen.id,
             verifier.id,
+            credential.id,
             request.purpose,
+            approvedFields,
             request.requested_fields,
             request.id,
+            presentation,
+            request.expires_at,
+            Boolean(input.shareAttachment),
           ],
-    )) as ConsentRow;
+        )) as ConsentRow);
 
     await appendAuditEvent({
       eventType: 'CONSENT_APPROVED',
@@ -1413,10 +1524,12 @@ router.post(
         requestId: request.id,
         purpose: request.purpose,
         sharedFields: approvedFields,
+        shareAttachment: Boolean(input.shareAttachment),
         hiddenFields: request.requested_fields.filter((f) => !approvedFields.includes(f)),
         notRequestedButPresent: [...available].filter((f) => !request.requested_fields.includes(f)),
       },
     });
+
     await appendAuditEvent({
       eventType: 'CREDENTIAL_PRESENTED',
       citizenId: citizen.id,
@@ -1550,10 +1663,10 @@ router.post(
     const consent = (await queryOne<ConsentRow>(
       `INSERT INTO consents
          (citizen_id, verifier_id, credential_id, purpose, fields, requested_fields,
-          status, presentation_request_id, presentation, expires_at, revoked)
-       VALUES ($1, $2, $3, $4, $5, $5, 'APPROVED', $6, $7, $8, FALSE)
+          status, presentation_request_id, presentation, expires_at, share_attachment, revoked)
+       VALUES ($1, $2, $3, $4, $5, $5, 'APPROVED', $6, $7, $8, $9, FALSE)
        RETURNING *`,
-      [citizen.id, verifier.id, credential.id, input.purpose, input.fields, request.id, presentation, request.expires_at],
+      [citizen.id, verifier.id, credential.id, input.purpose, input.fields, request.id, presentation, request.expires_at, Boolean(input.shareAttachment)],
     )) as ConsentRow;
 
     await appendAuditEvent({
@@ -1567,9 +1680,11 @@ router.post(
         purpose: input.purpose,
         initiatedBy: 'citizen',
         sharedFields: input.fields,
+        shareAttachment: Boolean(input.shareAttachment),
         hiddenFields: [...available].filter((f) => !input.fields.includes(f)),
       },
     });
+
     await appendAuditEvent({
       eventType: 'CREDENTIAL_PRESENTED',
       citizenId: citizen.id,
@@ -1635,10 +1750,12 @@ router.get(
                 jwt: null,
                 vc_json: null,
                 status_index: 0,
+                attachment_id: null,
                 revoked: false,
                 issued_at: row.created_at,
                 expires_at: row.expires_at,
               };
+
         return consentDto(row, verifier, credential);
       }),
     });
@@ -1808,6 +1925,17 @@ router.post(
     // The backend — not the UI — enforces that requested fields exist in the
     // credential schema for the requested type.
     const allowed = new Set(schemaFields(input.credentialType));
+    if (input.credentialType === 'DocumentCredential') {
+      const citizenCreds = await query<CredentialRow>(
+        'SELECT * FROM credentials WHERE citizen_id = $1 AND type = $2',
+        [citizen.id, 'DocumentCredential'],
+      );
+      for (const c of citizenCreds.rows) {
+        for (const key of claimKeys(c.sd_jwt)) {
+          allowed.add(key);
+        }
+      }
+    }
     const unknownFields = input.requestedFields.filter((f) => !allowed.has(f));
     if (unknownFields.length > 0) {
       throw new HttpError(400, `These fields are not part of ${input.credentialType}`, {
@@ -1833,11 +1961,12 @@ router.post(
          (citizen_id, verifier_id, credential_id, purpose, fields, requested_fields,
           status, presentation_request_id, expires_at, revoked)
        SELECT $1, $2,
-              COALESCE((SELECT id FROM credentials WHERE citizen_id = $1 AND type = $3 ORDER BY id DESC LIMIT 1), 0),
+              (SELECT id FROM credentials WHERE citizen_id = $1 AND (type = $3 OR $3 = 'DocumentCredential') ORDER BY id DESC LIMIT 1),
               $4, '{}', $5, 'PENDING', $6, $7, FALSE
        RETURNING *`,
       [citizen.id, verifier.id, input.credentialType, input.purpose, request.requested_fields, request.id, request.expires_at],
     )) as ConsentRow;
+
 
     await appendAuditEvent({
       eventType: 'CONSENT_REQUESTED',
@@ -2206,6 +2335,14 @@ router.post(
       },
     });
 
+    const attachmentMeta =
+      granted && consent?.share_attachment && credential?.attachment_id
+        ? await queryOne<{ id: number; file_name: string; mime: string; size: number; sha256: string }>(
+            'SELECT id, file_name, mime, size, sha256 FROM document_files WHERE id = $1',
+            [credential.attachment_id],
+          )
+        : null;
+
     res.json({
       result: granted ? 'granted' : 'denied',
       // On denial we deliberately return nothing about the credential contents.
@@ -2229,10 +2366,20 @@ router.post(
             subject: verification?.payload?.sub ?? null,
             statusIndex: credential.status_index,
             vcId: (credential.vc_json as { id?: string } | null)?.id ?? verification?.payload?.vc_id ?? null,
+            attachmentId: credential.attachment_id ?? null,
+          }
+        : null,
+      attachment: attachmentMeta
+        ? {
+            id: attachmentMeta.id,
+            name: attachmentMeta.file_name,
+            mime: attachmentMeta.mime,
+            size: attachmentMeta.size,
+            sha256: attachmentMeta.sha256,
           }
         : null,
       comparison: {
-        lifelink: {
+        gitlink: {
           verificationTimeMs: durationMs,
           documentsUploaded: 0,
           formsFilled: 0,
@@ -2247,6 +2394,138 @@ router.post(
       },
       verifiedAt: new Date().toISOString(),
     });
+  }),
+);
+
+/**
+ * Verifier retrieves a shared attachment file.
+ * Access is permitted ONLY while valid, unexpired, unrevoked consent with
+ * share_attachment=TRUE exists for this verifier and the credential was verified.
+ * Immediate cutoff upon consent revocation or expiry. Every view is audited.
+ */
+router.get(
+  '/verifier/attachments/:attachmentId',
+  requireVerifier,
+  route(async (req, res) => {
+    const auth = getAuth(req);
+    let actingVerifierId: number;
+    let actingVerifierDid: string;
+    if (auth.kind === 'verifier') {
+      const v = await loadVerifier(auth.id);
+      actingVerifierId = v.id;
+      actingVerifierDid = v.did;
+    } else if (auth.kind === 'organization' || auth.kind === 'issuer') {
+      const org = await loadIssuer(auth.id);
+      const linked = await ensureLinkedVerifier(org);
+      actingVerifierId = linked.id;
+      actingVerifierDid = linked.did;
+    } else {
+      throw new HttpError(403, 'Only a verifier or organization may access shared attachments.');
+    }
+
+    const attachmentId = idFromPath(req, 'attachmentId');
+
+    const consent = await queryOne<ConsentRow>(
+      `SELECT co.*
+       FROM consents co
+       JOIN credentials c ON c.id = co.credential_id
+       WHERE co.verifier_id = $1
+         AND c.attachment_id = $2
+         AND co.share_attachment = TRUE
+         AND co.status = 'APPROVED'
+         AND co.revoked = FALSE
+         AND co.expires_at > NOW()
+       ORDER BY co.id DESC
+       LIMIT 1`,
+      [actingVerifierId, attachmentId],
+    );
+
+    if (!consent) {
+      throw new HttpError(
+        403,
+        'Access denied: consent for this attached file does not exist, was ended by the student, or has expired.',
+      );
+    }
+
+    const verifiedLog = await queryOne<AuditLogRow>(
+      `SELECT * FROM audit_log
+       WHERE event_type = 'CREDENTIAL_VERIFIED'
+         AND verifier_id = $1
+         AND credential_id = $2
+       LIMIT 1`,
+      [actingVerifierId, consent.credential_id],
+    );
+
+    if (!verifiedLog) {
+      throw new HttpError(403, 'Access denied: credential presentation must be verified before viewing attachments.');
+    }
+
+    const file = await queryOne<DocumentFileRow>(
+      'SELECT * FROM document_files WHERE id = $1',
+      [attachmentId],
+    );
+    if (!file) {
+      throw new HttpError(404, 'Attached file record not found.');
+    }
+
+    const decrypted = decryptFileBytes(file.encrypted_bytes);
+
+    await appendAuditEvent({
+      eventType: 'ATTACHMENT_VIEWED',
+      citizenId: consent.citizen_id,
+      verifierId: actingVerifierId,
+      credentialId: consent.credential_id,
+      payload: {
+        action: 'verifier_view_attachment',
+        attachmentId: file.id,
+        fileName: file.file_name,
+        size: file.size,
+        mime: file.mime,
+        verifierDid: actingVerifierDid,
+        consentId: consent.id,
+      },
+    });
+
+    res.setHeader('Content-Type', file.mime);
+    res.setHeader('Content-Disposition', `inline; filename="${file.file_name}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.send(decrypted);
+  }),
+);
+
+/** Citizen views their own credential attachment file. */
+router.get(
+  '/wallet/attachments/:attachmentId',
+  requireCitizen,
+  route(async (req, res) => {
+    const auth = getAuth(req);
+    const attachmentId = idFromPath(req, 'attachmentId');
+    const file = await queryOne<DocumentFileRow>(
+      'SELECT * FROM document_files WHERE id = $1 AND owner = $2',
+      [attachmentId, auth.id],
+    );
+    if (!file) {
+      throw new HttpError(404, 'Attachment not found or does not belong to you.');
+    }
+
+    const decrypted = decryptFileBytes(file.encrypted_bytes);
+
+    await appendAuditEvent({
+      eventType: 'ATTACHMENT_VIEWED',
+      citizenId: auth.id,
+      payload: {
+        action: 'student_view_own_attachment',
+        attachmentId: file.id,
+        fileName: file.file_name,
+        size: file.size,
+        mime: file.mime,
+      },
+    });
+
+    res.setHeader('Content-Type', file.mime);
+    res.setHeader('Content-Disposition', `inline; filename="${file.file_name}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.send(decrypted);
   }),
 );
 
@@ -2298,6 +2577,7 @@ router.get(
     });
   }),
 );
+
 
 /* ------------------------------------------------------------------ */
 /* 5b. OpenID4VP request fetch                                          */
@@ -2556,11 +2836,12 @@ router.get(
 /**
  * Citizen submits a document for verification (Flow B). The document NEVER
  * becomes a credential here — it creates a PENDING request for the chosen
- * organization to review.
+ * organization to review. Accepts multipart/form-data with actual file upload.
  */
 router.post(
   '/wallet/documents',
   requireCitizen,
+  upload.single('file'),
   route(async (req, res) => {
     const auth = getAuth(req);
     const input = parseBody(documentSubmitBody, req.body);
@@ -2575,22 +2856,52 @@ router.post(
         `${org.name} (${org.org_type}) cannot verify "${input.documentType}". Choose one of: ${eligible.join(', ')}.`,
       );
     }
-    if (input.documentRef.length > 15000) {
-      throw new HttpError(400, 'Document reference too large (demo stores metadata, not multi-MB files).');
+
+    let fileId: number | null = null;
+    let mimeType = input.mimeType || 'application/pdf';
+    let documentRef = input.documentRef || '';
+    let fileName = '';
+    let fileSize = 0;
+    let sha256 = '';
+
+    if (req.file) {
+      const detected = detectMimeAndValidate(req.file.buffer);
+      mimeType = detected.mime;
+      fileName = req.file.originalname;
+      fileSize = req.file.size;
+      sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+      const encrypted = encryptFileBytes(req.file.buffer);
+      const insertedFile = await queryOne<DocumentFileRow>(
+        `INSERT INTO document_files (owner, file_name, mime, size, sha256, encrypted_bytes)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [citizen.id, fileName, mimeType, fileSize, sha256, encrypted],
+      );
+      if (insertedFile) {
+        fileId = insertedFile.id;
+        documentRef = `${fileName} (SHA-256: ${sha256.substring(0, 16)}...)`;
+      }
+    } else if (!documentRef) {
+      throw new HttpError(400, 'A document file (PDF, PNG, or JPEG) or document reference is required.');
     }
+
+    if (documentRef.length > 15000) {
+      throw new HttpError(400, 'Document reference too large.');
+    }
+
     const inserted = await queryOne<DocumentRequestRow>(
       `INSERT INTO document_requests
          (citizen_id, organization_id, document_type, document_name, document_ref,
-          mime_type, purpose, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING') RETURNING *`,
+          mime_type, purpose, status, file_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8) RETURNING *`,
       [
         citizen.id,
         org.id,
         normalizeDocumentType(input.documentType),
         input.documentName,
-        input.documentRef,
-        input.mimeType,
+        documentRef,
+        mimeType,
         input.purpose,
+        fileId,
       ],
     );
     const doc = inserted as DocumentRequestRow;
@@ -2604,10 +2915,23 @@ router.post(
         documentName: doc.document_name,
         organizationName: org.name,
         purpose: doc.purpose,
+        fileId,
+        fileName: fileName || undefined,
+        fileSize: fileSize || undefined,
       },
     });
     res.status(201).json({
-      document: documentDto(doc, citizen, org),
+      document: documentDto(
+        {
+          ...doc,
+          file_name: fileName,
+          file_mime: mimeType,
+          file_size: fileSize,
+          file_sha256: sha256,
+        },
+        citizen,
+        org,
+      ),
       message: `${doc.document_name} sent to ${org.name} for verification. Status: Pending Verification.`,
     });
   }),
@@ -2619,8 +2943,14 @@ router.get(
   requireCitizen,
   route(async (req, res) => {
     const auth = getAuth(req);
-    const result = await query<DocumentRequestRow>(
-      'SELECT * FROM document_requests WHERE citizen_id = $1 ORDER BY created_at DESC, id DESC',
+    const result = await query<
+      DocumentRequestRow & { file_name?: string; file_mime?: string; file_size?: number; file_sha256?: string }
+    >(
+      `SELECT dr.*, df.file_name, df.mime AS file_mime, df.size AS file_size, df.sha256 AS file_sha256
+       FROM document_requests dr
+       LEFT JOIN document_files df ON df.id = dr.file_id
+       WHERE dr.citizen_id = $1
+       ORDER BY dr.created_at DESC, dr.id DESC`,
       [auth.id],
     );
     const documents = await Promise.all(
@@ -2636,6 +2966,34 @@ router.get(
   }),
 );
 
+/** Citizen views their own uploaded document file. */
+router.get(
+  '/wallet/documents/:id/file',
+  requireCitizen,
+  route(async (req, res) => {
+    const auth = getAuth(req);
+    const doc = await loadDocumentRequest(idFromPath(req));
+    if (doc.citizen_id !== auth.id) {
+      throw new HttpError(403, 'This document does not belong to you.');
+    }
+    if (!doc.file_id) {
+      throw new HttpError(404, 'No file attached to this document.');
+    }
+    const file = await queryOne<DocumentFileRow>(
+      'SELECT * FROM document_files WHERE id = $1 AND owner = $2',
+      [doc.file_id, auth.id],
+    );
+    if (!file) {
+      throw new HttpError(404, 'Document file not found.');
+    }
+    const decrypted = decryptFileBytes(file.encrypted_bytes);
+    res.setHeader('Content-Type', file.mime);
+    res.setHeader('Content-Disposition', `inline; filename="${file.file_name}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.send(decrypted);
+  }),
+);
+
 /** Organization's incoming verification queue (own requests only). */
 router.get(
   '/organization/documents',
@@ -2645,12 +3003,24 @@ router.get(
     const status = typeof req.query.status === 'string' ? req.query.status.toUpperCase() : null;
     const rows =
       status && ['PENDING', 'APPROVED', 'REJECTED'].includes(status)
-        ? await query<DocumentRequestRow>(
-            'SELECT * FROM document_requests WHERE organization_id = $1 AND status = $2 ORDER BY created_at DESC, id DESC',
+        ? await query<
+            DocumentRequestRow & { file_name?: string; file_mime?: string; file_size?: number; file_sha256?: string }
+          >(
+            `SELECT dr.*, df.file_name, df.mime AS file_mime, df.size AS file_size, df.sha256 AS file_sha256
+             FROM document_requests dr
+             LEFT JOIN document_files df ON df.id = dr.file_id
+             WHERE dr.organization_id = $1 AND dr.status = $2
+             ORDER BY dr.created_at DESC, dr.id DESC`,
             [auth.id, status],
           )
-        : await query<DocumentRequestRow>(
-            'SELECT * FROM document_requests WHERE organization_id = $1 ORDER BY created_at DESC, id DESC',
+        : await query<
+            DocumentRequestRow & { file_name?: string; file_mime?: string; file_size?: number; file_sha256?: string }
+          >(
+            `SELECT dr.*, df.file_name, df.mime AS file_mime, df.size AS file_size, df.sha256 AS file_sha256
+             FROM document_requests dr
+             LEFT JOIN document_files df ON df.id = dr.file_id
+             WHERE dr.organization_id = $1
+             ORDER BY dr.created_at DESC, dr.id DESC`,
             [auth.id],
           );
     const documents = await Promise.all(
@@ -2684,9 +3054,54 @@ router.get(
   }),
 );
 
+/** Organization views uploaded file for review (streams decrypted bytes inline). */
+router.get(
+  '/organization/documents/:id/file',
+  requireOrganization,
+  route(async (req, res) => {
+    const auth = getAuth(req);
+    const doc = await loadDocumentRequest(idFromPath(req));
+    if (doc.organization_id !== auth.id) {
+      throw new HttpError(403, 'This verification request belongs to another organization.');
+    }
+    if (!doc.file_id) {
+      throw new HttpError(404, 'No file attached to this document request.');
+    }
+    const file = await queryOne<DocumentFileRow>(
+      'SELECT * FROM document_files WHERE id = $1',
+      [doc.file_id],
+    );
+    if (!file) {
+      throw new HttpError(404, 'Attached file record not found.');
+    }
+
+    const decrypted = decryptFileBytes(file.encrypted_bytes);
+
+    await appendAuditEvent({
+      eventType: 'ATTACHMENT_VIEWED',
+      citizenId: doc.citizen_id,
+      issuerId: auth.id,
+      payload: {
+        action: 'organization_review_file',
+        documentRequestId: doc.id,
+        fileId: file.id,
+        fileName: file.file_name,
+        size: file.size,
+        mime: file.mime,
+      },
+    });
+
+    res.setHeader('Content-Type', file.mime);
+    res.setHeader('Content-Disposition', `inline; filename="${file.file_name}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.send(decrypted);
+  }),
+);
+
 /**
  * Organization approves: validates structured claims, signs the credential,
- * places it in the citizen wallet, and marks the request APPROVED.
+ * links the uploaded file as attachmentId, places it in the citizen wallet,
+ * and marks the request APPROVED.
  */
 router.post(
   '/organization/documents/:id/approve',
@@ -2706,18 +3121,36 @@ router.post(
     const citizen = await loadCitizen(doc.citizen_id);
     const input = parseBody(documentApproveBody, req.body);
     const credentialType = credentialTypeForDocument(doc.document_type);
+
+    const rawClaims = { ...input.claims };
+    if (doc.file_id && !rawClaims.attachmentId) {
+      rawClaims.attachmentId = doc.file_id;
+    }
+    if (!rawClaims.documentName) {
+      rawClaims.documentName = doc.document_name;
+    }
+    if (!rawClaims.holderName) {
+      rawClaims.holderName = citizen.name;
+    }
+    if (!rawClaims.issuedDate) {
+      rawClaims.issuedDate = new Date().toISOString().split('T')[0];
+    }
+
     const { credential, combined, vc, claims } = await issueCredentialCore({
       issuer: org,
       citizen,
       type: credentialType,
-      rawClaims: input.claims,
+      rawClaims,
       expiresInDays: input.expiresInDays,
+      attachmentId: doc.file_id ?? null,
     });
+
     const updated = (await queryOne<DocumentRequestRow>(
       `UPDATE document_requests SET status = 'APPROVED', credential_id = $1,
               reviewed_at = NOW(), reviewer = $2 WHERE id = $3 RETURNING *`,
       [credential.id, org.name, doc.id],
     )) as DocumentRequestRow;
+
     await appendAuditEvent({
       eventType: 'DOCUMENT_APPROVED',
       citizenId: citizen.id,
@@ -2729,6 +3162,7 @@ router.post(
         credentialType,
         credentialId: credential.id,
         reviewer: org.name,
+        attachmentId: doc.file_id ?? null,
       },
     });
     await appendAuditEvent({
@@ -2740,17 +3174,20 @@ router.post(
         documentRequestId: doc.id,
         credentialType,
         credentialId: credential.id,
+        attachmentId: doc.file_id ?? null,
       },
     });
+
     res.status(201).json({
-      document: documentDto(updated, citizen, org),
-      credential: credentialDto(credential, org, claims, auth),
+      document: documentDto({ ...updated, file_name: doc.file_name, file_mime: doc.file_mime, file_size: doc.file_size, file_sha256: doc.file_sha256 }, citizen, org),
+      credential: credentialDto({ ...credential, attachment_name: doc.file_name, attachment_mime: doc.file_mime, attachment_size: doc.file_size, attachment_sha256: doc.file_sha256 }, org, claims, auth),
       sdJwt: combined,
       vc,
       message: `Approved. ${credentialType} issued to ${citizen.name} and added to their wallet.`,
     });
   }),
 );
+
 
 /** Organization rejects with a reason (own requests only). */
 router.post(
@@ -2812,6 +3249,17 @@ router.post(
     const citizen = await loadCitizen(input.citizenId);
     const linked = await ensureLinkedVerifier(org);
     const allowed = new Set(schemaFields(input.credentialType));
+    if (input.credentialType === 'DocumentCredential') {
+      const citizenCreds = await query<CredentialRow>(
+        'SELECT * FROM credentials WHERE citizen_id = $1 AND type = $2',
+        [citizen.id, 'DocumentCredential'],
+      );
+      for (const c of citizenCreds.rows) {
+        for (const key of claimKeys(c.sd_jwt)) {
+          allowed.add(key);
+        }
+      }
+    }
     const unknownFields = input.requestedFields.filter((f) => !allowed.has(f));
     if (unknownFields.length > 0) {
       throw new HttpError(400, `These fields are not part of ${input.credentialType}`, {
@@ -2834,11 +3282,12 @@ router.post(
          (citizen_id, verifier_id, credential_id, purpose, fields, requested_fields,
           status, presentation_request_id, expires_at, revoked)
        SELECT $1, $2,
-              COALESCE((SELECT id FROM credentials WHERE citizen_id = $1 AND type = $3 ORDER BY id DESC LIMIT 1), NULL),
+              (SELECT id FROM credentials WHERE citizen_id = $1 AND (type = $3 OR $3 = 'DocumentCredential') ORDER BY id DESC LIMIT 1),
               $4, '{}', $5, 'PENDING', $6, $7, FALSE
        RETURNING *`,
       [citizen.id, linked.id, input.credentialType, input.purpose, request.requested_fields, request.id, request.expires_at],
     )) as ConsentRow;
+
     await appendAuditEvent({
       eventType: 'CONSENT_REQUESTED',
       citizenId: citizen.id,

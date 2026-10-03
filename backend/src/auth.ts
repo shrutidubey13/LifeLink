@@ -9,8 +9,8 @@
  *   ADMIN        — privileged trust-registry operator (admins table)
  *
  * Legacy `issuer` tokens map to the same issuers table as `organization`;
- * legacy `verifier` tokens map to the verifiers table (kept so old demo
- * databases keep working). New code issues `organization` tokens.
+ * legacy `verifier` tokens map to the verifiers table (kept for backward
+ * compatibility). New code issues `organization` tokens.
  *
  * Design, in one paragraph:
  *   Each account has an email + bcrypt password hash. Logging in returns a

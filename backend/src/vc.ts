@@ -36,7 +36,7 @@ export interface VerifiableCredential {
 }
 
 export interface BuildVcInput {
-  /** Stable credential id, e.g. `urn:lifelink:credential:42`. */
+  /** Stable credential id, e.g. `urn:gitlink:credential:42`. */
   id: string;
   issuerDid: string;
   subjectDid: string;
@@ -67,7 +67,7 @@ export function buildVc(input: BuildVcInput): VerifiableCredential {
       statusListCredential: input.statusListUrl,
     },
     credentialSchema: {
-      id: `lifelink:${input.type}:1`,
+      id: `gitlink:${input.type}:1`,
       type: 'JsonSchema',
     },
   };

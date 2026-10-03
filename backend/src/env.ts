@@ -29,9 +29,9 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
     );
   }
 
-  if (!env.AUTH_JWT_SECRET || env.AUTH_JWT_SECRET === 'dev-only-secret-change-me') {
+  if (!env.AUTH_JWT_SECRET || env.AUTH_JWT_SECRET === 'change-me-production-secret' || env.AUTH_JWT_SECRET === 'dev-only-secret-change-me') {
     const message =
-      'AUTH_JWT_SECRET is not set (or is still the dev default). Anyone holding it can mint login sessions.';
+      'AUTH_JWT_SECRET is not set (or is still the default). Anyone holding it can mint login sessions.';
     if (isProduction) {
       throw new Error(`${message} Refusing to start in production.`);
     }

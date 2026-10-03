@@ -40,6 +40,7 @@ export function ConsentModal({
   const [purpose, setPurpose] = useState('');
   const [selected, setSelected] = useState<string[]>([]);
   const [duration, setDuration] = useState('30m');
+  const [shareAttachment, setShareAttachment] = useState(Boolean(credential.attachment || credential.attachmentId));
   const dialogRef = useRef<HTMLDivElement>(null);
 
   const share = useAction(api.share);
@@ -79,6 +80,7 @@ export function ConsentModal({
       purpose: purpose.trim(),
       fields: selected,
       duration,
+      shareAttachment: Boolean(credential.attachment || credential.attachmentId) && shareAttachment,
     });
     if (result) onApprove(result);
   }
@@ -203,6 +205,29 @@ export function ConsentModal({
                 />
               ))}
             </div>
+
+            {Boolean(credential.attachment || credential.attachmentId) && (
+              <div className="mt-3 p-3.5 rounded-xl border border-indigo-200 bg-indigo-50/50">
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={shareAttachment}
+                    onChange={(e) => setShareAttachment(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <div>
+                    <span className="text-sm font-semibold text-slate-800">
+                      Share attached file {credential.attachment ? `(${credential.attachment.name})` : ''}
+                    </span>
+                    {credential.attachment && (
+                      <span className="block text-xs text-slate-500 font-mono mt-0.5">
+                        {(credential.attachment.size / 1024).toFixed(1)} KB · {credential.attachment.mime}
+                      </span>
+                    )}
+                  </div>
+                </label>
+              </div>
+            )}
           </div>
 
           {/* 4. HOW LONG */}

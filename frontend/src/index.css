@@ -4,11 +4,13 @@
 
 @layer base {
   html {
+    font-size: 17px;
     -webkit-text-size-adjust: 100%;
   }
 
   body {
-    @apply bg-slate-100 text-slate-800 antialiased;
+    @apply bg-slate-100 text-slate-800 antialiased text-base;
+    font-size: 17px;
   }
 
   /* Keyboard focus is always visible: this app is about consent, so controls

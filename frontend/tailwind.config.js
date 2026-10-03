@@ -16,6 +16,10 @@ export default {
         ],
         mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
       },
+      fontSize: {
+        xs: ['0.875rem', { lineHeight: '1.25rem' }],
+        sm: ['0.9375rem', { lineHeight: '1.375rem' }],
+      },
       keyframes: {
         'fade-in': {
           from: { opacity: '0', transform: 'translateY(4px)' },

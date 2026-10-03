@@ -62,7 +62,7 @@ function independentDigest(ascii: string): string {
 }
 
 async function main(): Promise<void> {
-  console.log('\nLifeLink crypto self-test (no database needed)\n');
+  console.log('\nGitLink crypto self-test (no database needed)\n');
 
   // ---- RFC 9901 disclosure encoding ----------------------------------
   console.log('RFC 9901 disclosure encoding');
@@ -113,7 +113,7 @@ async function main(): Promise<void> {
   console.log('\nSD-JWT issuance');
   const claims = {
     employmentStatus: 'employed',
-    employer: 'Demo Employer Pvt Ltd',
+    employer: 'TechNova Pvt Ltd',
     jobTitle: 'Software Engineer',
     joiningDate: '2025-08-01',
     salary: 1800000,
@@ -124,7 +124,7 @@ async function main(): Promise<void> {
     subject: citizenDid,
     type: 'EmploymentCredential',
     claims,
-    vcId: 'urn:lifelink:test:1',
+    vcId: 'urn:gitlink:test:1',
     expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
     statusListUrl: 'http://localhost:4000/status-lists/1',
     statusIndex: 7,
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
     !Buffer.from(issued.jwt.split('.')[1], 'base64url').toString().includes('employmentStatus'),
   );
   check('header alg is EdDSA', JSON.parse(base64urlDecode(issued.jwt.split('.')[0]).toString()).alg === JWS_ALG);
-  check('vc_id cross-reference carried', issued.payload.vc_id === 'urn:lifelink:test:1');
+  check('vc_id cross-reference carried', issued.payload.vc_id === 'urn:gitlink:test:1');
 
   // ---- selective presentation (no KB) ---------------------------------
   console.log('\nSelective disclosure presentation');
@@ -160,7 +160,7 @@ async function main(): Promise<void> {
   // ---- SD-JWT+KB holder binding ---------------------------------------
   console.log('\nSD-JWT+KB holder binding');
   const nonce = base64urlEncode(randomBytes(16));
-  const aud = 'did:web:bank.demo.lifelink';
+  const aud = 'did:web:bank.gitlink';
   const kb = await attachKeyBinding({
     presentationWithoutKb: presentation,
     holderPrivateKey: citizenKeys.privateKey,
@@ -249,9 +249,9 @@ async function main(): Promise<void> {
   // ---- credential schemas -------------------------------------------------
   console.log('\nCredential schemas');
   const goodDegree = validateClaims('DegreeCredential', {
-    name: 'Demo Student',
+    name: 'Aarav Sharma',
     degree: 'B.Tech',
-    university: 'Demo University',
+    university: 'XIE University',
     graduationYear: 2025,
   });
   check('valid DegreeCredential accepted', goodDegree.ok);
@@ -273,17 +273,28 @@ async function main(): Promise<void> {
   check('unknown type rejected', !validateClaims('PassportCredential', { a: 1 }).ok);
   const goodEmp = validateClaims('EmploymentCredential', {
     employmentStatus: 'employed',
-    employer: 'Demo Employer Pvt Ltd',
+    employer: 'TechNova Pvt Ltd',
     jobTitle: 'Software Engineer',
     joiningDate: '2025-08-01',
     salary: 1800000,
   });
   check('valid EmploymentCredential (with salary) accepted', goodEmp.ok);
 
+  const goodDoc = validateClaims('DocumentCredential', {
+    documentName: 'Bachelor of Computer Applications',
+    category: 'Degree',
+    description: 'Degree certificate awarded for graduation',
+    holderName: 'Aarav Sharma',
+    issuedDate: '2026-05-15',
+    extraFields: { gpa: '3.8' },
+    attachmentId: 1,
+  });
+  check('valid DocumentCredential accepted', goodDoc.ok);
+
   // ---- W3C VC 2.0 mapping --------------------------------------------------
   console.log('\nW3C VC 2.0 representation');
   const vc = buildVc({
-    id: 'urn:lifelink:test:1',
+    id: 'urn:gitlink:test:1',
     issuerDid,
     subjectDid: citizenDid,
     type: 'EmploymentCredential',
@@ -313,15 +324,9 @@ async function main(): Promise<void> {
   console.log('\nDocument verification mapping (Flow B)');
   const { normalizeDocumentType, credentialTypeForDocument, eligibleOrgTypesForDocument } =
     await import('./documentTypes.js');
-  check('BCA_Degree.pdf normalizes to Degree', normalizeDocumentType('BCA_Degree.pdf') === 'Degree');
-  check('Degree maps to DegreeCredential', credentialTypeForDocument('BCA_Degree.pdf') === 'DegreeCredential');
-  check(
-    'Degree eligible orgs are universities',
-    (eligibleOrgTypesForDocument('Degree') ?? []).includes('University'),
-  );
-  check('Employment maps to EmploymentCredential', credentialTypeForDocument('Employment') === 'EmploymentCredential');
-  check('KYC maps to BankCustomerCredential', credentialTypeForDocument('KYC') === 'BankCustomerCredential');
-  check('Health maps to HealthCredential', credentialTypeForDocument('Health') === 'HealthCredential');
+  check('Document name preserved', normalizeDocumentType('Bachelor of Computer Applications') === 'Bachelor of Computer Applications');
+  check('Custom document maps to DocumentCredential', credentialTypeForDocument('Bachelor of Computer Applications') === 'DocumentCredential');
+  check('Any org is eligible for document', eligibleOrgTypesForDocument('AnyDocument') === null);
   check('uploaded doc never auto-issues (mapping only, no signing here)', credentialTypeForDocument('Degree') !== ('TRUSTED' as unknown as string));
 
   // ---- selective disclosure enforcement -------------------------------------

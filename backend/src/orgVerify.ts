@@ -360,23 +360,41 @@ export async function verifyOrganizationPresentation(args: {
     },
   });
 
-  return {
-    result: granted ? 'granted' : 'denied',
-    revealed: granted && verification ? verification.revealed : {},
-    revealedFields: granted ? revealedKeys : [],
-    withheldFields:
-      granted && credential
-        ? claimKeys(credential.sd_jwt).filter((k) => !revealedKeys.includes(k))
-        : [],
-    checks,
-    organization: { id: org.id, name: org.name, did: org.did },
-    verifier: { id: verifier.id, name: verifier.name, did: verifier.did },
-    request: request
-      ? { id: request.id, purpose: request.purpose, requestedFields: request.requested_fields, nonce: request.nonce }
-      : null,
-    credential: credential
-      ? { id: credential.id, type: credential.type, typeLabel: typeLabel(credential.type) }
-      : null,
-    verifiedAt: new Date().toISOString(),
-  };
-}
+    const attachmentMeta =
+      granted && consent?.share_attachment && credential?.attachment_id
+        ? await queryOne<{ id: number; file_name: string; mime: string; size: number; sha256: string }>(
+            'SELECT id, file_name, mime, size, sha256 FROM document_files WHERE id = $1',
+            [credential.attachment_id],
+          )
+        : null;
+
+    return {
+      result: granted ? 'granted' : 'denied',
+      revealed: granted && verification ? verification.revealed : {},
+      revealedFields: granted ? revealedKeys : [],
+      withheldFields:
+        granted && credential
+          ? claimKeys(credential.sd_jwt).filter((k) => !revealedKeys.includes(k))
+          : [],
+      checks,
+      organization: { id: org.id, name: org.name, did: org.did },
+      verifier: { id: verifier.id, name: verifier.name, did: verifier.did },
+      request: request
+        ? { id: request.id, purpose: request.purpose, requestedFields: request.requested_fields, nonce: request.nonce }
+        : null,
+      credential: credential
+        ? { id: credential.id, type: credential.type, typeLabel: typeLabel(credential.type), attachmentId: credential.attachment_id ?? null }
+        : null,
+      attachment: attachmentMeta
+        ? {
+            id: attachmentMeta.id,
+            name: attachmentMeta.file_name,
+            mime: attachmentMeta.mime,
+            size: attachmentMeta.size,
+            sha256: attachmentMeta.sha256,
+          }
+        : null,
+      verifiedAt: new Date().toISOString(),
+    };
+  }
+

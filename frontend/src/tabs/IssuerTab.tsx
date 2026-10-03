@@ -12,8 +12,8 @@ export function IssuerTab(_props: { citizens?: unknown[] }) {
       subtitle="Issuance now lives in the Organization dashboard (unified ORGANIZATION role)."
     >
       <p className="text-sm text-slate-600">
-        Log in as an organization (e.g. university@lifelink.demo) to issue credentials directly,
-        review citizen documents, and verify presentations.
+        Log in as an organization (e.g. university@gitlink.org) to issue documents directly,
+        review student documents, and verify presentations.
       </p>
     </Card>
   );
