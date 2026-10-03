@@ -51,7 +51,8 @@ const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvw
 /**
  * Minimal base58btc encoder (multibase prefix "z").
  *
- * We implement it here (10 lines) instead of adding a dependency.
+ * We implement base58 here (~40 lines for both directions) instead of adding
+ * a dependency.
  */
 export function base58Encode(bytes: Buffer): string {
   let zeroes = 0;
@@ -75,6 +76,30 @@ export function base58Encode(bytes: Buffer): string {
   return '1'.repeat(zeroes) + digits.reverse().map((d) => BASE58_ALPHABET[d]).join('');
 }
 
+/** Minimal base58btc decoder (inverse of base58Encode, for DID resolution). */
+export function base58Decode(input: string): Buffer {
+  if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(input)) {
+    throw new Error('did:key: payload is not base58btc');
+  }
+  let zeroes = 0;
+  while (zeroes < input.length && input[zeroes] === '1') zeroes += 1;
+
+  const bytes: number[] = [];
+  for (const char of input) {
+    let carry = BASE58_ALPHABET.indexOf(char);
+    for (let i = 0; i < bytes.length; i += 1) {
+      carry += bytes[i] * 58;
+      bytes[i] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  return Buffer.from([...new Array<number>(zeroes).fill(0), ...bytes.reverse()]);
+}
+
 /**
  * Build a `did:key` DID from an Ed25519 public JWK.
  *
@@ -93,6 +118,58 @@ export function didKeyFromPublicJwk(jwk: JWK): string {
 /** did:web DIDs embed the host, with ":" percent-encoded (e.g. localhost%3A4000). */
 export function didWeb(hostWithPort: string): string {
   return `did:web:${hostWithPort.replace(/:/g, '%3A')}`;
+}
+
+export interface ResolvedDidKey {
+  /** The DID as given. */
+  did: string;
+  /** The Ed25519 public key in JWK form (the DID's verification material). */
+  publicJwk: JWK;
+  /** Conventional verification-method fragment for the key. */
+  verificationMethod: string;
+}
+
+/**
+ * Resolve a `did:key` DID to its verification material — for real, not via a
+ * database lookup. Parsing enforces the multicodec contract (0xed01 =
+ * ed25519-pub, exactly 32 key bytes follow), so a malformed or non-Ed25519
+ * DID fails here instead of silently verifying against the wrong key.
+ *
+ * Honest scope note: this is method-correct local resolution for did:key. For
+ * did:web we do NOT dereference `https://<host>/.well-known/did.json` in this
+ * prototype; issuer identity for did:web comes from the trust-registry record
+ * (see README § "DID limitations").
+ */
+export function resolveDidKey(did: string): ResolvedDidKey {
+  const prefix = 'did:key:z';
+  if (!did.startsWith(prefix)) {
+    throw new Error(`Cannot resolve "${did}": only did:key DIDs are resolvable here`);
+  }
+  const bytes = base58Decode(did.slice(prefix.length));
+  if (bytes.length !== 34 || bytes[0] !== 0xed || bytes[1] !== 0x01) {
+    throw new Error(
+      'Cannot resolve did:key: expected multicodec 0xed01 (ed25519-pub) followed by 32 key bytes',
+    );
+  }
+  const publicJwk: JWK = {
+    kty: 'OKP',
+    crv: 'Ed25519',
+    x: base64urlEncode(bytes.subarray(2)),
+  };
+  return { did, publicJwk, verificationMethod: `${did}#${did.slice(prefix.length).slice(0, 8)}` };
+}
+
+/**
+ * Convenience: resolve and check that the resolved key MATCHES an expected
+ * JWK (e.g. the holder key on file). Catches key-substitution attacks where a
+ * validly-formed DID is simply not the credential subject's DID.
+ */
+export function didKeyMatchesJwk(did: string, expected: JWK): boolean {
+  try {
+    return resolveDidKey(did).publicJwk.x === expected.x;
+  } catch {
+    return false;
+  }
 }
 
 export interface Ed25519KeyPair {

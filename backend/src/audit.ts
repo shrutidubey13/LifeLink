@@ -32,6 +32,7 @@ export interface AuditEventInput {
   citizenId?: number | null;
   verifierId?: number | null;
   credentialId?: number | null;
+  issuerId?: number | null;
   /** Any JSON-serialisable summary. Values are NOT stored (see README on privacy). */
   payload: Record<string, unknown>;
 }
@@ -93,14 +94,15 @@ export async function appendAuditEvent(event: AuditEventInput): Promise<AuditLog
 
     const inserted = await client.query<AuditLogRow>(
       `INSERT INTO audit_log
-         (event_type, citizen_id, verifier_id, credential_id, payload, prev_hash, hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+         (event_type, citizen_id, verifier_id, credential_id, issuer_id, payload, prev_hash, hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
         event.eventType,
         event.citizenId ?? null,
         event.verifierId ?? null,
         event.credentialId ?? null,
+        event.issuerId ?? null,
         payload,
         prevHash,
         hash,

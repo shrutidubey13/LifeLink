@@ -1,12 +1,11 @@
 /**
- * Tab 4 — the tamper-evident audit log.
- *
- * Every issue, revoke, consent, consent-end and verification is appended to a
- * hash chain. This tab recomputes the chain on demand and shows whether it is
- * intact, or exactly which entry was tampered with.
+ * Tamper-evident audit log, role-scoped:
+ * citizen → own history (/wallet/audit), organization → own activity
+ * (/organization/audit), admin → system-wide (/admin/audit).
  */
 import { useState } from 'react';
 import { api } from '../lib/api';
+import { useAuth } from '../lib/auth';
 import { EVENT_STYLES, fieldLabel } from '../lib/catalog';
 import { formatDateTime, prettyJson, shortHash } from '../lib/format';
 import { useAction, useRequest } from '../lib/hooks';
@@ -15,22 +14,30 @@ import { Badge, Card, ErrorBlock, InlineError, LoadingBlock, SectionTitle, Spinn
 
 const FILTERS: { value: AuditEventType | 'ALL'; label: string }[] = [
   { value: 'ALL', label: 'All events' },
-  { value: 'ISSUER_CREDENTIAL_ISSUED', label: 'Issued' },
-  { value: 'ISSUER_CREDENTIAL_REVOKED', label: 'Revoked' },
-  { value: 'CONSENT_GRANTED', label: 'Consent' },
-  { value: 'CONSENT_REVOKED', label: 'Consent ended' },
-  { value: 'VERIFICATION_GRANTED', label: 'Granted' },
-  { value: 'VERIFICATION_DENIED', label: 'Denied' },
+  { value: 'CREDENTIAL_ISSUED', label: 'Issued' },
+  { value: 'DOCUMENT_SUBMITTED', label: 'Submitted' },
+  { value: 'DOCUMENT_APPROVED', label: 'Approved' },
+  { value: 'CREDENTIAL_REVOKED', label: 'Revoked' },
+  { value: 'CONSENT_APPROVED', label: 'Consent' },
+  { value: 'CREDENTIAL_VERIFIED', label: 'Granted' },
+  { value: 'VERIFICATION_FAILED', label: 'Denied' },
 ];
 
 export function AuditTab() {
-  const audit = useRequest(() => api.audit(200), 'audit');
-  const verifyChain = useAction(api.auditVerify);
+  const { user } = useAuth();
+  const loader = () => {
+    if (user?.kind === 'admin') return api.adminAudit(200);
+    if (user?.kind === 'organization' || user?.kind === 'issuer') return api.orgAudit(200);
+    return api.walletAudit(200);
+  };
+  const audit = useRequest(loader, `audit-${user?.kind}-${user?.id}`);
+  const verifyChain = useAction(api.adminAuditVerify);
   const [filter, setFilter] = useState<AuditEventType | 'ALL'>('ALL');
   const [verifyResult, setVerifyResult] = useState<{ valid: boolean; length: number; reason: string | null; brokenAtEntry: number | null } | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
 
   async function runVerify() {
+    if (user?.kind !== 'admin') return;
     const result = await verifyChain.run();
     if (result) {
       setVerifyResult({
@@ -42,7 +49,6 @@ export function AuditTab() {
     }
   }
 
-  // A local alias keeps TypeScript's null-narrowing alive inside the JSX below.
   const data = audit.data;
 
   const entries = (data?.entries ?? []).filter(
@@ -56,15 +62,16 @@ export function AuditTab() {
 
       {data && (
         <>
-          {/* Chain health */}
           <Card
             title="Hash chain integrity"
             subtitle={data.chain.rule}
             actions={
-              <button type="button" className="btn-secondary" onClick={() => void runVerify()} disabled={verifyChain.pending}>
-                {verifyChain.pending ? <Spinner /> : null}
-                Re-verify chain
-              </button>
+              user?.kind === 'admin' ? (
+                <button type="button" className="btn-secondary" onClick={() => void runVerify()} disabled={verifyChain.pending}>
+                  {verifyChain.pending ? <Spinner /> : null}
+                  Re-verify chain
+                </button>
+              ) : undefined
             }
           >
             <div
@@ -75,11 +82,7 @@ export function AuditTab() {
               }`}
             >
               <div>
-                <p
-                  className={`text-lg font-bold ${
-                    data.chain.valid ? 'text-emerald-800' : 'text-rose-800'
-                  }`}
-                >
+                <p className={`text-lg font-bold ${data.chain.valid ? 'text-emerald-800' : 'text-rose-800'}`}>
                   {data.chain.valid
                     ? '✓ Hash chain intact'
                     : `✕ Chain broken at entry #${data.chain.brokenAtEntry ?? '?'}`}
@@ -110,11 +113,10 @@ export function AuditTab() {
               No blockchain is involved. Each entry stores{' '}
               <code className="rounded bg-slate-100 px-1">hash = SHA-256(prev_hash + payload)</code> and the
               payload as text, so anyone can recompute the whole chain. Editing or deleting a single entry
-              breaks every hash after it.
+              breaks every hash after it. Citizens and organizations see only their own entries.
             </p>
           </Card>
 
-          {/* Filters */}
           <div>
             <SectionTitle hint={`${entries.length} shown / ${data.total} total`}>Events</SectionTitle>
             <div className="mb-3 flex flex-wrap gap-1.5">
@@ -177,11 +179,7 @@ function AuditRow({
   const payload = typeof entry.payload === 'string' ? entry.payload : entry.payload;
 
   return (
-    <li
-      className={`rounded-xl border bg-white ${
-        broken ? 'border-rose-400 ring-2 ring-rose-100' : 'border-slate-200'
-      }`}
-    >
+    <li className={`rounded-xl border bg-white ${broken ? 'border-rose-400 ring-2 ring-rose-100' : 'border-slate-200'}`}>
       <button type="button" onClick={onToggle} className="flex w-full items-start gap-3 p-3 text-left">
         <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-slate-100 font-mono text-[11px] font-bold text-slate-600">
           {entry.id}
@@ -196,20 +194,14 @@ function AuditRow({
             {formatDateTime(entry.createdAt)} · prev {shortHash(entry.prevHash)} · hash {shortHash(entry.hash)}
           </span>
         </span>
-        <span aria-hidden="true" className="mt-1 text-slate-400">
-          {expanded ? '▾' : '▸'}
-        </span>
+        <span aria-hidden="true" className="mt-1 text-slate-400">{expanded ? '▾' : '▸'}</span>
       </button>
 
       {expanded && (
         <div className="border-t border-slate-100 p-3">
           <div className="mb-2 grid gap-2 text-[11px] text-slate-600 sm:grid-cols-2">
-            <p className="break-all">
-              <span className="font-semibold text-slate-700">prev_hash:</span> {entry.prevHash}
-            </p>
-            <p className="break-all">
-              <span className="font-semibold text-slate-700">hash:</span> {entry.hash}
-            </p>
+            <p className="break-all"><span className="font-semibold text-slate-700">prev_hash:</span> {entry.prevHash}</p>
+            <p className="break-all"><span className="font-semibold text-slate-700">hash:</span> {entry.hash}</p>
           </div>
           <pre className="max-h-64 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[10px] leading-relaxed text-slate-100">
             {prettyJson(payload)}
@@ -220,33 +212,29 @@ function AuditRow({
   );
 }
 
-/** One line describing an audit entry, without dumping the whole payload. */
 function summarise(entry: AuditEntry): string {
   const payload = entry.payload;
   if (typeof payload !== 'object' || payload === null) return String(payload);
-
   const parts: string[] = [];
   if (typeof payload.issuerName === 'string') parts.push(payload.issuerName);
+  if (typeof payload.organizationName === 'string') parts.push(payload.organizationName);
   if (typeof payload.typeLabel === 'string') parts.push(payload.typeLabel);
   else if (typeof payload.type === 'string') parts.push(payload.type);
+  if (typeof payload.credentialType === 'string') parts.push(payload.credentialType);
+  if (typeof payload.documentType === 'string') parts.push(payload.documentType);
+  if (typeof payload.documentName === 'string') parts.push(payload.documentName);
   if (typeof payload.purpose === 'string') parts.push(`“${payload.purpose}”`);
-  if (typeof payload.verifierDid === 'string') parts.push(payload.verifierDid);
   if (typeof payload.change === 'string') parts.push(`→ ${payload.change}`);
   if (Array.isArray(payload.sharedFields) && payload.sharedFields.length > 0) {
     parts.push(`shared: ${payload.sharedFields.map((f) => fieldLabel(String(f))).join(', ')}`);
   }
-  if (Array.isArray(payload.hiddenFields) && payload.hiddenFields.length > 0) {
-    parts.push(`kept private: ${payload.hiddenFields.length} field(s)`);
-  }
   if (Array.isArray(payload.deniedBecause) && payload.deniedBecause.length > 0) {
     parts.push(`failed: ${payload.deniedBecause.join(', ')}`);
   }
-  if (typeof payload.revealedFields === 'string') parts.push(`revealed: ${payload.revealedFields}`);
   if (Array.isArray(payload.revealedFields) && payload.revealedFields.length > 0) {
     parts.push(`revealed: ${payload.revealedFields.map((f) => fieldLabel(String(f))).join(', ')}`);
   }
   if (typeof payload.reason === 'string') parts.push(`— ${payload.reason}`);
   if (typeof payload.durationMs === 'number') parts.push(`in ${payload.durationMs} ms`);
-
   return parts.length > 0 ? parts.join(' · ') : entry.eventType;
 }

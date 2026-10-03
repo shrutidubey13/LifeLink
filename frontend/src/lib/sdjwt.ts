@@ -50,14 +50,14 @@ export function decodePresentation(presentation: string): DecodedPresentation | 
   }
 
   const disclosures: PresentedDisclosure[] = [];
-  for (const disclosure of parts.slice(1)) {
-    const dot = disclosure.indexOf('.');
-    if (dot < 0) continue;
+  for (const part of parts.slice(1)) {
+    // KB-JWT has 3 dot-segments; disclosures are a single base64url token.
+    if (part.split('.').length === 3) continue;
+    if (part.includes('.')) continue;
     try {
-      const body = JSON.parse(base64urlToUtf8(disclosure.slice(dot + 1))) as Record<string, unknown>;
-      const keys = Object.keys(body).filter((k) => k !== 'sd');
-      if (keys.length === 1) {
-        disclosures.push({ key: keys[0], value: body[keys[0]] });
+      const parsed: unknown = JSON.parse(base64urlToUtf8(part));
+      if (Array.isArray(parsed) && parsed.length === 3 && typeof parsed[1] === 'string') {
+        disclosures.push({ key: parsed[1] as string, value: parsed[2] });
       }
     } catch {
       /* skip unreadable disclosure */

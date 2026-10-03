@@ -1,5 +1,9 @@
 /**
- * The front door: citizen and verifier login + registration.
+ * The front door: citizen / organization / admin login + citizen registration.
+ *
+ * Organizations use ONE login (university, employer, bank, hospital). Admins
+ * have a separate privileged login. Legacy verifier login is kept for old
+ * demo databases.
  *
  * One-click demo buttons log in with the seeded accounts so a demo never gets
  * stuck typing passwords on stage.
@@ -10,9 +14,17 @@ import type { AccountKind } from '../lib/types';
 import { Field, InlineError, Spinner } from './ui';
 
 const DEMO_ACCOUNTS: { kind: AccountKind; label: string; email: string; password: string }[] = [
-  { kind: 'citizen', label: 'Demo Student (citizen)', email: 'student@demo.lifelink', password: 'lifelink123' },
-  { kind: 'verifier', label: 'Demo Bank (verifier)', email: 'bank@demo.lifelink', password: 'lifelink123' },
-  { kind: 'verifier', label: 'Demo Employer HR (verifier)', email: 'hr@demo.lifelink', password: 'lifelink123' },
+  { kind: 'citizen', label: 'Demo Student (citizen)', email: 'student@lifelink.demo', password: 'lifelink123' },
+  { kind: 'organization', label: 'ABC University (organization)', email: 'university@lifelink.demo', password: 'lifelink123' },
+  { kind: 'organization', label: 'XYZ Company (organization)', email: 'employer@lifelink.demo', password: 'lifelink123' },
+  { kind: 'organization', label: 'ABC Bank (organization)', email: 'bank@lifelink.demo', password: 'lifelink123' },
+  { kind: 'admin', label: 'Demo Admin (admin)', email: 'admin@lifelink.demo', password: 'lifelink123' },
+];
+
+const ROLE_TABS: { id: AccountKind; label: string }[] = [
+  { id: 'citizen', label: '👛 Citizen' },
+  { id: 'organization', label: '🏛 Organization' },
+  { id: 'admin', label: '🛡 Admin' },
 ];
 
 export function LoginScreen() {
@@ -40,6 +52,7 @@ export function LoginScreen() {
   }
 
   const busy = pending || demoPending !== null;
+  const canRegister = kind === 'citizen';
 
   return (
     <div className="mx-auto flex min-h-[70vh] w-full max-w-md flex-col justify-center px-4 py-10">
@@ -47,32 +60,35 @@ export function LoginScreen() {
         <p className="text-4xl" aria-hidden="true">🔗</p>
         <h1 className="mt-2 text-2xl font-bold text-slate-900">Welcome to LifeLink</h1>
         <p className="mt-1 text-sm text-slate-500">
-          Citizens own their wallet. Verifiers check what was shared with them. Log in to begin.
+          Citizens own their wallet. Organizations issue and verify. Admins guard trust.
         </p>
       </div>
 
       <div className="card mt-6">
         {/* role picker */}
-        <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1" role="tablist" aria-label="I am a">
-          {(['citizen', 'verifier'] as AccountKind[]).map((option) => (
+        <div className="grid grid-cols-3 gap-2 rounded-xl bg-slate-100 p-1" role="tablist" aria-label="I am a">
+          {ROLE_TABS.map((option) => (
             <button
-              key={option}
+              key={option.id}
               type="button"
               role="tab"
-              aria-selected={kind === option}
-              onClick={() => setKind(option)}
-              className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
-                kind === option ? 'bg-white text-indigo-700 shadow' : 'text-slate-500 hover:text-slate-700'
+              aria-selected={kind === option.id}
+              onClick={() => {
+                setKind(option.id);
+                setMode('login');
+              }}
+              className={`rounded-lg px-2 py-2 text-sm font-semibold transition ${
+                kind === option.id ? 'bg-white text-indigo-700 shadow' : 'text-slate-500 hover:text-slate-700'
               }`}
             >
-              {option === 'citizen' ? '👛 Citizen' : '🏦 Verifier'}
+              {option.label}
             </button>
           ))}
         </div>
 
-        {/* login / register toggle */}
+        {/* login / register toggle (citizens only can self-register) */}
         <div className="mt-4 flex gap-4 border-b border-slate-200">
-          {(['login', 'register'] as const).map((option) => (
+          {(['login', ...(canRegister ? ['register' as const] : [])] as const).map((option) => (
             <button
               key={option}
               type="button"
@@ -85,15 +101,22 @@ export function LoginScreen() {
             </button>
           ))}
         </div>
+        {kind !== 'citizen' && (
+          <p className="mt-2 text-xs text-slate-500">
+            {kind === 'organization'
+              ? 'Organization accounts are created by an admin. Use a demo button below.'
+              : 'Admin login only. No public registration.'}
+          </p>
+        )}
 
         <form onSubmit={(e) => void submit(e)} className="mt-4 space-y-4">
           {mode === 'register' && (
-            <Field label={kind === 'citizen' ? 'Your full name' : 'Organisation name'} htmlFor="auth-name">
+            <Field label="Your full name" htmlFor="auth-name">
               <input
                 id="auth-name"
                 className="input"
                 autoComplete="name"
-                placeholder={kind === 'citizen' ? 'e.g. Priya Sharma' : 'e.g. Demo Bank'}
+                placeholder="e.g. Priya Sharma"
                 value={name}
                 disabled={busy}
                 onChange={(e) => setName(e.target.value)}
@@ -107,7 +130,13 @@ export function LoginScreen() {
               className="input"
               type="email"
               autoComplete="email"
-              placeholder="you@example.com"
+              placeholder={
+                kind === 'citizen'
+                  ? 'student@lifelink.demo'
+                  : kind === 'organization'
+                    ? 'university@lifelink.demo'
+                    : 'admin@lifelink.demo'
+              }
               value={email}
               disabled={busy}
               onChange={(e) => setEmail(e.target.value)}

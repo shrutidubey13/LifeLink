@@ -39,7 +39,7 @@ export const STAGES: Stage[] = [
     id: 'finance',
     label: 'Finance',
     short: 'Bank and insurance KYC',
-    credentialType: 'BankKycCredential',
+    credentialType: 'BankCustomerCredential',
     icon: '🏦',
     blurb: 'KYC, account and policy details',
   },
@@ -53,62 +53,70 @@ export const STAGES: Stage[] = [
   },
 ];
 
-/** Example claims offered by the issuer portal when you pick a type. */
+/** Example claims offered by the issuer portal when you pick a type. Must match backend/schemas.ts exactly. */
 export const EXAMPLE_CLAIMS: Record<string, Record<string, unknown>> = {
   DegreeCredential: {
-    degree: 'Bachelor of Technology',
-    university: 'Demo University',
-    field_of_study: 'Computer Science',
-    year_of_graduation: 2025,
-    student_id: 'LL-2025-0001',
+    name: 'Demo Student',
+    degree: 'BCA Computer Applications',
+    university: 'ABC University',
+    graduationYear: 2026,
+    fieldOfStudy: 'Computer Applications',
+    studentId: 'LL-2026-0001',
   },
   EmploymentCredential: {
-    employer: 'Demo Employer Pvt Ltd',
-    role: 'Software Engineer',
-    status: 'employed',
-    joined_on: '2025-08-01',
-    salary: 1800000,
-    offer_letter_number: 'EMP-OL-4471',
+    employmentStatus: 'employed',
+    employer: 'XYZ Company',
+    jobTitle: 'Software Engineer',
+    joiningDate: '2025-08-01',
+    employeeId: 'EMP-4471',
   },
-  BankKycCredential: {
-    bank: 'Demo Bank',
-    account_type: 'Savings',
-    kyc_status: 'verified',
-    aadhaar_last4: '4821',
-    pan_masked: 'ABCDE****K',
+  BankCustomerCredential: {
+    customerName: 'Demo Student',
+    accountType: 'Savings',
+    kycStatus: 'verified',
+    aadhaarLast4: '4821',
+    panMasked: 'ABCDE****K',
   },
   HealthCredential: {
-    provider: 'Demo Hospital',
-    blood_group: 'O+',
-    condition_status: 'fit',
-    insurance_id: 'INS-88213',
+    fullName: 'Demo Student',
+    bloodGroup: 'O+',
+    fitnessStatus: 'fit',
+    insuranceId: 'INS-88213',
   },
 };
 
 /** Extra types the issuer portal offers. */
-export const EXTRA_TYPES: Record<string, Record<string, unknown>> = {
-  AddressCredential: {
-    address: '42 Lake Road, Pune 411001',
-    state: 'Maharashtra',
-    pincode: '411001',
-    verified_on: '2025-06-12',
-  },
-  VehicleCredential: {
-    make: 'Demo Motors',
-    model: 'Model E',
-    registration: 'MH12AB1234',
-    insurance_valid_till: '2027-03-31',
-  },
-};
+export const EXTRA_TYPES: Record<string, Record<string, unknown>> = {};
 
 /**
  * Friendly labels. Anything not listed is prettified automatically
  * ("field_of_study" -> "Field of study").
  */
 const FIELD_LABELS: Record<string, string> = {
-  status: 'Employment status',
+  name: 'Full name',
+  degree: 'Qualification',
+  university: 'University',
+  graduationYear: 'Graduation year',
+  fieldOfStudy: 'Field of study',
+  studentId: 'Student ID',
+  employmentStatus: 'Employment status',
+  employer: 'Employer',
+  jobTitle: 'Job title',
+  joiningDate: 'Joining date',
   salary: 'Annual salary',
-  offer_letter_number: 'Offer letter number',
+  employeeId: 'Employee ID',
+  offerLetterNumber: 'Offer letter number',
+  customerName: 'Customer name',
+  accountType: 'Account type',
+  kycStatus: 'KYC status',
+  fullName: 'Full name',
+  bloodGroup: 'Blood group',
+  fitnessStatus: 'Fitness status',
+  insuranceId: 'Insurance ID',
+  address: 'Address',
+  aadhaarLast4: 'Aadhaar (last 4 digits)',
+  panMasked: 'PAN (masked)',
+  status: 'Employment status',
   role: 'Job title',
   joined_on: 'Joined on',
   student_id: 'Student ID',
@@ -156,6 +164,14 @@ export function typeLabel(type: string): string {
 /** The four types offered in the issuer portal, plus extras. */
 export const ISSUER_TYPES: string[] = [...Object.keys(EXAMPLE_CLAIMS), ...Object.keys(EXTRA_TYPES)];
 
+/** Document types citizens can submit, mapped to eligible org types. */
+export const DOCUMENT_TYPES: { value: string; label: string; hint: string }[] = [
+  { value: 'Degree', label: 'Degree / Marksheet', hint: 'Verified by a University/College' },
+  { value: 'Employment', label: 'Employment / Offer letter', hint: 'Verified by an Employer' },
+  { value: 'KYC', label: 'KYC / Bank document', hint: 'Verified by a Bank' },
+  { value: 'Health', label: 'Health / Fitness record', hint: 'Verified by a Hospital' },
+];
+
 export function exampleClaimsFor(type: string): Record<string, unknown> {
   return EXAMPLE_CLAIMS[type] ?? EXTRA_TYPES[type] ?? { full_name: 'Demo Student' };
 }
@@ -182,11 +198,26 @@ export const PURPOSE_SUGGESTIONS = [
 
 /** Colour + label for each audit event type. */
 export const EVENT_STYLES: Record<string, { label: string; className: string }> = {
+  CREDENTIAL_ISSUED: { label: 'Credential issued', className: 'bg-indigo-50 text-indigo-700' },
+  CREDENTIAL_RECEIVED: { label: 'Credential received', className: 'bg-indigo-50 text-indigo-700' },
+  DOCUMENT_SUBMITTED: { label: 'Document submitted', className: 'bg-sky-50 text-sky-700' },
+  DOCUMENT_APPROVED: { label: 'Document approved', className: 'bg-emerald-50 text-emerald-700' },
+  DOCUMENT_REJECTED: { label: 'Document rejected', className: 'bg-rose-50 text-rose-700' },
+  CONSENT_REQUESTED: { label: 'Consent requested', className: 'bg-sky-50 text-sky-700' },
+  CONSENT_APPROVED: { label: 'Consent granted', className: 'bg-sky-50 text-sky-700' },
+  CONSENT_REJECTED: { label: 'Consent ended', className: 'bg-slate-100 text-slate-700' },
+  CONSENT_DENIED: { label: 'Consent denied', className: 'bg-slate-100 text-slate-700' },
+  CONSENT_REVOKED: { label: 'Consent ended', className: 'bg-slate-100 text-slate-700' },
+  CREDENTIAL_PRESENTED: { label: 'Credential shared', className: 'bg-sky-50 text-sky-700' },
+  CREDENTIAL_SHARED: { label: 'Credential shared', className: 'bg-sky-50 text-sky-700' },
+  CREDENTIAL_VERIFIED: { label: 'Verification granted', className: 'bg-emerald-50 text-emerald-700' },
+  VERIFICATION_FAILED: { label: 'Verification denied', className: 'bg-rose-50 text-rose-700' },
+  CREDENTIAL_REVOKED: { label: 'Credential revoked', className: 'bg-rose-50 text-rose-700' },
+  TRUST_REGISTRY_UPDATED: { label: 'Trust registry changed', className: 'bg-amber-50 text-amber-700' },
+  // Legacy aliases (old frontend vocabulary)
   ISSUER_CREDENTIAL_ISSUED: { label: 'Credential issued', className: 'bg-indigo-50 text-indigo-700' },
   ISSUER_CREDENTIAL_REVOKED: { label: 'Credential revoked', className: 'bg-rose-50 text-rose-700' },
   CONSENT_GRANTED: { label: 'Consent granted', className: 'bg-sky-50 text-sky-700' },
-  CONSENT_REVOKED: { label: 'Consent ended', className: 'bg-slate-100 text-slate-700' },
   VERIFICATION_GRANTED: { label: 'Verification granted', className: 'bg-emerald-50 text-emerald-700' },
   VERIFICATION_DENIED: { label: 'Verification denied', className: 'bg-rose-50 text-rose-700' },
-  TRUST_REGISTRY_UPDATED: { label: 'Trust registry changed', className: 'bg-amber-50 text-amber-700' },
 };

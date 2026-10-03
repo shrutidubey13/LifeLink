@@ -1,25 +1,34 @@
 /**
- * Login + authorization for citizens and verifiers.
+ * Login + authorization for citizen / organization / admin (plus legacy
+ * issuer + verifier aliases kept for backward compatibility).
+ *
+ * Role model (single ORGANIZATION role):
+ *   CITIZEN      — wallet owner (citizens table)
+ *   ORGANIZATION — university/employer/bank/hospital (issuers table, with
+ *                  org_type + can_issue/can_verify capabilities)
+ *   ADMIN        — privileged trust-registry operator (admins table)
+ *
+ * Legacy `issuer` tokens map to the same issuers table as `organization`;
+ * legacy `verifier` tokens map to the verifiers table (kept so old demo
+ * databases keep working). New code issues `organization` tokens.
  *
  * Design, in one paragraph:
- *   Citizens and verifiers each have an email + bcrypt password hash. Logging
- *   in (or registering) returns a short-lived JWT (HS256, signed with the
- *   server secret) that says { kind: "citizen" | "verifier", sub: <id> }.
- *   Protected routes demand that token and check the caller only touches
- *   their OWN records — a citizen can never read another citizen's wallet,
- *   and a verifier can never spend another verifier's consent.
+ *   Each account has an email + bcrypt password hash. Logging in returns a
+ *   short-lived JWT (HS256, signed with the server secret) that says
+ *   { kind, sub: <id> }. Protected routes demand that token, and identity
+ *   ALWAYS comes from the token — never from an id in the request body
+ *   (issuerId/citizenId/verifierId in a body are ignored or rejected when the
+ *   token already says who is calling).
  *
  * What this is NOT: a full identity system. There is no email verification,
- * no password reset, and no refresh-token rotation. Those are listed as
- * future work in the README. Good enough for a hackathon demo, honest about
- * what it is.
+ * no password reset, and no refresh-token rotation (future work, see README).
  */
 import type { NextFunction, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import { HttpError, config } from './config';
 
-export type AccountKind = 'citizen' | 'verifier';
+export type AccountKind = 'citizen' | 'issuer' | 'verifier' | 'admin' | 'organization';
 
 /** What a verified login token carries. `sub` is the citizen/verifier id. */
 export interface AuthContext {
@@ -92,10 +101,18 @@ export async function verifyToken(token: string): Promise<AuthContext> {
     const kind = payload.kind as string;
     const id = Number(payload.sub);
     const email = payload.email as string;
-    if ((kind !== 'citizen' && kind !== 'verifier') || !Number.isInteger(id) || id <= 0) {
+    if (
+      (kind !== 'citizen' &&
+        kind !== 'issuer' &&
+        kind !== 'organization' &&
+        kind !== 'verifier' &&
+        kind !== 'admin') ||
+      !Number.isInteger(id) ||
+      id <= 0
+    ) {
       throw new Error('bad claims');
     }
-    return { kind, id, email: typeof email === 'string' ? email : '' };
+    return { kind: kind as AccountKind, id, email: typeof email === 'string' ? email : '' };
   } catch {
     throw new HttpError(401, 'Your session is invalid or has expired. Please log in again.');
   }
@@ -147,4 +164,16 @@ export function requireAuth(...allowed: AccountKind[]) {
 
 /** Shorthands so route definitions read naturally. */
 export const requireCitizen = requireAuth('citizen');
-export const requireVerifier = requireAuth('verifier');
+/** Issuer endpoints accept both legacy `issuer` and new `organization` tokens. */
+export const requireIssuer = requireAuth('issuer', 'organization');
+/**
+ * Verifier endpoints accept legacy `verifier` tokens AND organization tokens
+ * (an ORGANIZATION with can_verify acts as verifier; capability is checked
+ * inside the handler via the issuers row).
+ */
+export const requireVerifier = requireAuth('verifier', 'issuer', 'organization');
+/** Organization-only (unified issuer+verifier login). */
+export const requireOrganization = requireAuth('organization', 'issuer');
+export const requireAdmin = requireAuth('admin');
+/** Any logged-in account (used for low-sensitivity directories). */
+export const requireLogin = requireAuth('citizen', 'issuer', 'organization', 'verifier', 'admin');

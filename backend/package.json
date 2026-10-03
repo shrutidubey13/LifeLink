@@ -10,6 +10,7 @@
     "db:init": "tsx src/migrate.ts",
     "seed": "tsx src/seed.ts",
     "seed:reset": "tsx src/seed.ts --reset",
+    "gen:key": "tsx src/genkey.ts",
     "test:crypto": "tsx src/selftest.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -18,8 +19,11 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
     "jose": "^5.9.3",
-    "pg": "^8.12.0"
+    "pg": "^8.12.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

@@ -1,51 +1,50 @@
 /**
  * LifeLink app shell: login gate, role-based tabs, and session header.
  *
- * Citizens see:  Wallet (credentials + sharing + who verified me), Issuer portal, Audit log.
- * Verifiers see: Verifier portal (profile + verify + history), Audit log.
- *
- * The issuer portal stays open to every logged-in user on purpose: in this
- * demo the citizen drives issuance themselves (standing in for the university).
- * In production, issuers would be separate accounts with their own login.
+ * Citizens get their own sidebar wallet (see CitizenApp.tsx).
+ * Organizations see: Dashboard (documents to review + issue + verify), Audit.
+ * Admins see: Trust registry, Audit.
+ * Legacy verifiers see: Verifier portal, Audit (kept for old databases).
  */
 import { useEffect, useState } from 'react';
-import { API_BASE, api } from './lib/api';
+import { API_BASE } from './lib/api';
 import { AuthProvider, useAuth } from './lib/auth';
-import { useRequest } from './lib/hooks';
-import type { Citizen } from './lib/types';
-import { WalletTab } from './tabs/WalletTab';
-import { IssuerTab } from './tabs/IssuerTab';
+import { CitizenApp } from './CitizenApp';
+import { OrganizationTab } from './tabs/OrganizationTab';
 import { VerifierTab } from './tabs/VerifierTab';
+import { AdminTab } from './tabs/AdminTab';
 import { AuditTab } from './tabs/AuditTab';
 import { LoginScreen } from './components/LoginScreen';
-import { ErrorBlock, LoadingBlock } from './components/ui';
+import { LoadingBlock } from './components/ui';
 
-type CitizenTab = 'wallet' | 'issuer' | 'audit';
+type OrgTab = 'dashboard' | 'audit';
+type AdminTabId = 'admin' | 'audit';
 type VerifierTabId = 'verifier' | 'audit';
 
-const CITIZEN_TABS: { id: CitizenTab; label: string; icon: string; blurb: string }[] = [
-  { id: 'wallet', label: 'Wallet', icon: '👛', blurb: 'Your credentials, sharing, and who verified you' },
-  { id: 'issuer', label: 'Issuer portal', icon: '🏫', blurb: 'Sign and revoke credentials (demo stand-in for institutions)' },
-  { id: 'audit', label: 'Audit log', icon: '🔗', blurb: 'Tamper-evident history' },
+const ORG_TABS: { id: OrgTab; label: string; icon: string; blurb: string }[] = [
+  { id: 'dashboard', label: 'Organization', icon: '🏛', blurb: 'Verify documents, issue credentials, verify presentations' },
+  { id: 'audit', label: 'Activity', icon: '🔗', blurb: 'Your issuance/verification activity' },
+];
+
+const ADMIN_TABS: { id: AdminTabId; label: string; icon: string; blurb: string }[] = [
+  { id: 'admin', label: 'Trust Registry', icon: '🛡', blurb: 'Approve, suspend, or revoke organizations' },
+  { id: 'audit', label: 'Audit log', icon: '🔗', blurb: 'System-wide tamper-evident history' },
 ];
 
 const VERIFIER_TABS: { id: VerifierTabId; label: string; icon: string; blurb: string }[] = [
-  { id: 'verifier', label: 'Verifier portal', icon: '🏦', blurb: 'Your profile, verifications, and checking shared records' },
+  { id: 'verifier', label: 'Verifier portal', icon: '🏦', blurb: 'Verify presentations shared with you' },
   { id: 'audit', label: 'Audit log', icon: '🔗', blurb: 'Tamper-evident history' },
 ];
 
 function Shell() {
   const { user, ready, logout } = useAuth();
-  const [citizenTab, setCitizenTab] = useState<CitizenTab>('wallet');
+  const [orgTab, setOrgTab] = useState<OrgTab>('dashboard');
+  const [adminTab, setAdminTab] = useState<AdminTabId>('admin');
   const [verifierTab, setVerifierTab] = useState<VerifierTabId>('verifier');
 
-  // The citizen directory backs the issuer portal's "issue to whom" picker.
-  // It is only fetched once logged in (it needs no login itself, but there is
-  // no reason to fetch it for the login screen).
-  const citizens = useRequest(() => (user ? api.citizens() : Promise.resolve(null)), `citizens-${user?.id ?? 'none'}`);
-
   useEffect(() => {
-    if (user?.kind === 'citizen') setCitizenTab('wallet');
+    if (user?.kind === 'organization' || user?.kind === 'issuer') setOrgTab('dashboard');
+    if (user?.kind === 'admin') setAdminTab('admin');
     if (user?.kind === 'verifier') setVerifierTab('verifier');
   }, [user?.kind, user?.id]);
 
@@ -79,10 +78,12 @@ function Shell() {
     );
   }
 
-  const citizen: Citizen | null =
-    user.kind === 'citizen'
-      ? { id: user.id, name: user.name, did: user.did, email: user.email, hasLogin: true, createdAt: '' }
-      : null;
+  if (user.kind === 'citizen') {
+    return <CitizenApp />;
+  }
+
+  const roleLabel =
+    user.kind === 'organization' || user.kind === 'issuer' ? 'organization' : user.kind;
 
   return (
     <div className="min-h-screen">
@@ -94,15 +95,15 @@ function Shell() {
                 <span aria-hidden="true">🔗</span> LifeLink
               </h1>
               <p className="mt-1 max-w-xl text-sm text-indigo-50">
-                {user.kind === 'citizen'
-                  ? 'Your verified life, your data. Share exactly what is needed — nothing more.'
-                  : 'Check what citizens shared with you. Only consented fields ever arrive.'}
+                {user.kind === 'admin'
+                  ? 'Guard the trust registry. Only trusted organizations may sign.'
+                  : 'Issue credentials, verify documents, and check what was shared with you.'}
               </p>
             </div>
 
             <div className="rounded-xl bg-white/10 p-2 backdrop-blur">
               <span className="block text-[10px] font-bold uppercase tracking-wider text-indigo-100">
-                Logged in as {user.kind}
+                Logged in as {roleLabel}
               </span>
               <p className="mt-0.5 text-sm font-semibold text-white">{user.name}</p>
               <span className="block max-w-[15rem] truncate font-mono text-[10px] text-indigo-100">
@@ -120,31 +121,33 @@ function Shell() {
         </div>
       </header>
 
-      {user.kind === 'citizen' && citizen ? (
+      {(user.kind === 'organization' || user.kind === 'issuer') && (
         <>
-          <TabBar
-            tabs={CITIZEN_TABS}
-            active={citizenTab}
-            onChange={setCitizenTab}
-          />
+          <TabBar tabs={ORG_TABS} active={orgTab} onChange={setOrgTab} />
           <main className="mx-auto max-w-5xl px-4 py-5 sm:px-6 sm:py-6">
             <p className="mb-4 text-sm text-slate-500">
-              {CITIZEN_TABS.find((t) => t.id === citizenTab)?.blurb}
+              {ORG_TABS.find((t) => t.id === orgTab)?.blurb}
             </p>
-            {citizenTab === 'wallet' && <WalletTab citizen={citizen} />}
-            {citizenTab === 'issuer' && (
-              <>
-                {citizens.loading && <LoadingBlock label="Loading…" />}
-                {citizens.error && <ErrorBlock message={citizens.error} onRetry={citizens.reload} />}
-                {(citizens.data || (!citizens.loading && !citizens.error)) && (
-                  <IssuerTab citizens={citizens.data?.citizens ?? []} />
-                )}
-              </>
-            )}
-            {citizenTab === 'audit' && <AuditTab />}
+            {orgTab === 'dashboard' && <OrganizationTab />}
+            {orgTab === 'audit' && <AuditTab />}
           </main>
         </>
-      ) : (
+      )}
+
+      {user.kind === 'admin' && (
+        <>
+          <TabBar tabs={ADMIN_TABS} active={adminTab} onChange={setAdminTab} />
+          <main className="mx-auto max-w-5xl px-4 py-5 sm:px-6 sm:py-6">
+            <p className="mb-4 text-sm text-slate-500">
+              {ADMIN_TABS.find((t) => t.id === adminTab)?.blurb}
+            </p>
+            {adminTab === 'admin' && <AdminTab />}
+            {adminTab === 'audit' && <AuditTab />}
+          </main>
+        </>
+      )}
+
+      {user.kind === 'verifier' && (
         <>
           <TabBar tabs={VERIFIER_TABS} active={verifierTab} onChange={setVerifierTab} />
           <main className="mx-auto max-w-5xl px-4 py-5 sm:px-6 sm:py-6">

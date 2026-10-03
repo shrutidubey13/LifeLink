@@ -28,13 +28,11 @@ import { Badge, DidTag, Field, InlineError, Select, Spinner, Toggle } from './ui
 export function ConsentModal({
   credential,
   verifiers,
-  citizenId,
   onApprove,
   onClose,
 }: {
   credential: Credential;
   verifiers: Verifier[];
-  citizenId: number;
   onApprove: (result: ShareResult) => void;
   onClose: () => void;
 }) {
@@ -76,7 +74,6 @@ export function ConsentModal({
   async function approve() {
     if (!canApprove || verifierId === '') return;
     const result = await share.run({
-      citizenId,
       verifierId: Number(verifierId),
       credentialId: credential.id,
       purpose: purpose.trim(),

@@ -25,18 +25,15 @@ const SUB_OF: Partial<Record<CheckId, CheckId>> = { disclosure_integrity: 'signa
 
 export function VerifierTab({ userId }: { userId: number }) {
   const profile = useRequest(() => api.verifierProfile(), `verifier-profile-${userId}`);
-  const [consentId, setConsentId] = useState('');
   const [presentation, setPresentation] = useState('');
   const [result, setResult] = useState<VerifyResponse | null>(null);
 
   const verify = useAction(api.verify);
 
-  // Auto-fill from the wallet's stashed share (only when it was meant for us —
-  // a share for another verifier would just fail the consent check).
+  // Auto-fill from the wallet's stashed share.
   useEffect(() => {
     const stashed = takeStashedShare();
-    if (stashed && stashed.verifierId === userId) {
-      setConsentId(String(stashed.consentId));
+    if (stashed) {
       setPresentation(stashed.presentation);
       setResult(null);
     }
@@ -44,14 +41,10 @@ export function VerifierTab({ userId }: { userId: number }) {
 
   const preview = useMemo(() => (presentation ? decodePresentation(presentation) : null), [presentation]);
 
-  const canVerify = consentId.trim() !== '' && presentation.trim() !== '';
+  const canVerify = presentation.trim() !== '';
 
   async function runVerify() {
-    const response = await verify.run({
-      verifierId: userId,
-      consentId: Number(consentId),
-      presentation,
-    });
+    const response = await verify.run(presentation.trim());
     setResult(response);
     if (response) profile.reload();
   }
@@ -94,7 +87,7 @@ export function VerifierTab({ userId }: { userId: number }) {
         title="Verify a citizen"
         subtitle="No forms, no uploads. Paste (or auto-fill) the presentation the citizen shared with you."
       >
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 sm:grid-cols-1">
           <Field label="Verifying as" htmlFor="verifier-self">
             <input
               id="verifier-self"
@@ -102,18 +95,6 @@ export function VerifierTab({ userId }: { userId: number }) {
               value={profile.data?.verifier.name ?? '…'}
               disabled
               readOnly
-            />
-          </Field>
-
-          <Field label="Consent id" htmlFor="consent-id">
-            <input
-              id="consent-id"
-              className="input"
-              inputMode="numeric"
-              placeholder="e.g. 1"
-              value={consentId}
-              disabled={verify.pending}
-              onChange={(event) => setConsentId(event.target.value)}
             />
           </Field>
         </div>
@@ -197,7 +178,6 @@ export function VerifierTab({ userId }: { userId: number }) {
               className="btn-secondary"
               onClick={() => {
                 setPresentation('');
-                setConsentId('');
                 setResult(null);
                 verify.clearError();
               }}
@@ -300,7 +280,7 @@ function VerificationResult({ result }: { result: VerifyResponse }) {
             </h2>
             <p className={`mt-1 text-sm ${granted ? 'text-emerald-800' : 'text-rose-800'}`}>
               {granted
-                ? `${result.consent.credentialTypeLabel ?? 'Credential'} confirmed for ${result.credential.issuer.name}.`
+                ? `${result.consent?.credentialTypeLabel ?? result.credential?.typeLabel ?? 'Credential'} confirmed${result.credential?.issuer ? ` for ${result.credential.issuer.name}` : ''}.`
                 : 'The verifier received no personal data. See the failing check below.'}
             </p>
           </div>
@@ -309,8 +289,9 @@ function VerificationResult({ result }: { result: VerifyResponse }) {
           </Badge>
         </div>
         <p className={`mt-2 text-xs ${granted ? 'text-emerald-700' : 'text-rose-700'}`}>
-          Verified {formatDateTime(result.verifiedAt)} · credential #{result.credential.id} · consent #
-          {result.consent.id} · purpose “{result.consent.purpose}”
+          Verified {formatDateTime(result.verifiedAt)}
+          {result.credential ? ` · credential #${result.credential.id}` : ''}
+          {result.consent ? ` · consent #${result.consent.id} · purpose “${result.consent.purpose}”` : ''}
         </p>
       </div>
 
@@ -409,6 +390,7 @@ function VerificationResult({ result }: { result: VerifyResponse }) {
       </Card>
 
       {/* Before / after */}
+      {result.comparison && (
       <Card title="LifeLink vs the traditional way" subtitle="Same question, two very different answers.">
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-3">
@@ -433,6 +415,7 @@ function VerificationResult({ result }: { result: VerifyResponse }) {
           </div>
         </div>
       </Card>
+      )}
 
       <details>
         <summary className="cursor-pointer text-xs font-semibold text-slate-500">

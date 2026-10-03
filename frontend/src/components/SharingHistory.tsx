@@ -5,13 +5,17 @@ import type { Consent } from '../lib/types';
 import { Badge, EmptyState, Spinner } from './ui';
 
 const STATE_TONE: Record<Consent['state'], 'active' | 'expired' | 'ended'> = {
+  pending: 'active',
   active: 'active',
+  rejected: 'ended',
   expired: 'expired',
   ended: 'ended',
 };
 
 const STATE_TEXT: Record<Consent['state'], string> = {
+  pending: 'Awaiting decision',
   active: 'Access is live',
+  rejected: 'Denied',
   expired: 'Expired',
   ended: 'Ended early',
 };
@@ -39,7 +43,7 @@ export function SharingHistory({
   return (
     <ul className="space-y-3">
       {consents.map((consent) => {
-        const claims = claimsByCredential[consent.credentialId] ?? {};
+        const claims = consent.credentialId != null ? (claimsByCredential[consent.credentialId] ?? {}) : {};
         return (
           <li key={consent.id} className="rounded-xl border border-slate-200 bg-white p-3">
             <div className="flex flex-wrap items-start justify-between gap-2">

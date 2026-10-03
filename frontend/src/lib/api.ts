@@ -3,18 +3,27 @@
  *
  * Every call throws an `ApiError` carrying the backend's message, so each tab
  * can show a real error state instead of "something went wrong".
+ *
+ * Identity rule: the backend derives WHO is calling from the Bearer token.
+ * We never send citizenId/issuerId/verifierId to assert identity — those ids
+ * only name the OTHER party (e.g. which citizen to issue to).
  */
 import type {
   AccountKind,
+  AdminSession,
   AuditResponse,
+  ChainStatus,
   Citizen,
   CitizenSession,
   CitizenVerifications,
-  ChainStatus,
   Consent,
   Credential,
+  DocumentRequest,
   Issuer,
   IssuedCredential,
+  Organization,
+  OrganizationSession,
+  PresentationRequest,
   ShareResult,
   StatusList,
   Verifier,
@@ -106,64 +115,160 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const get = <T>(path: string) => request<T>(path);
 const post = <T>(path: string, body: unknown) =>
   request<T>(path, { method: 'POST', body: JSON.stringify(body ?? {}) });
-const del = <T>(path: string) => request<T>(path, { method: 'DELETE' });
 
 export const api = {
   health: () => get<{ status: string; time: string }>('/health'),
 
-  // auth
+  // auth (unified ORGANIZATION role + legacy aliases + admin)
   citizenLogin: (email: string, password: string) =>
     post<CitizenSession>('/auth/citizen/login', { email, password }),
   citizenRegister: (name: string, email: string, password: string) =>
     post<CitizenSession>('/auth/citizen/register', { name, email, password }),
+  organizationLogin: (email: string, password: string) =>
+    post<OrganizationSession>('/auth/organization/login', { email, password }),
+  issuerLogin: (email: string, password: string) =>
+    post<OrganizationSession>('/auth/issuer/login', { email, password }),
   verifierLogin: (email: string, password: string) =>
     post<VerifierSession>('/auth/verifier/login', { email, password }),
   verifierRegister: (name: string, email: string, password: string) =>
     post<VerifierSession>('/auth/verifier/register', { name, email, password }),
-  me: () => get<{ kind: AccountKind; citizen?: Citizen; verifier?: Verifier }>('/auth/me'),
+  adminLogin: (email: string, password: string) =>
+    post<AdminSession>('/auth/admin/login', { email, password }),
+  me: () =>
+    get<{
+      kind: AccountKind;
+      citizen?: Citizen;
+      organization?: Organization;
+      issuer?: Issuer;
+      verifier?: Verifier;
+      admin?: { id: number; name: string; email: string };
+    }>('/auth/me'),
 
   // actors + trust registry
   citizens: () => get<{ citizens: Citizen[] }>('/citizens'),
   verifiers: () => get<{ verifiers: Verifier[] }>('/verifiers'),
   issuers: () => get<{ issuers: Issuer[] }>('/trust-registry/issuers'),
-  trustIssuer: (id: number) => post<{ issuer: Issuer }>(`/trust-registry/issuers/${id}/trust`, {}),
-  untrustIssuer: (id: number) => del<{ issuer: Issuer }>(`/trust-registry/issuers/${id}/trust`),
+  organizations: (documentType?: string) =>
+    get<{ organizations: Organization[] }>(
+      documentType ? `/organizations?documentType=${encodeURIComponent(documentType)}` : '/organizations',
+    ),
+  organizationProfile: () =>
+    get<{ organization: Organization; linkedVerifier: Verifier; stats: Record<string, number> }>(
+      '/organization/profile',
+    ),
 
-  // issuer portal
+  // issuer / organization issuance (identity from JWT; no issuerId in body)
   issueCredential: (input: {
-    issuerId: number;
     citizenId: number;
     type: string;
     claims: Record<string, unknown>;
-    expiresInDays: number;
-  }) => post<{ credential: Credential; message: string }>('/issuer/credentials', input),
-  issuerCredentials: (issuerId: number) =>
-    get<{ issuer: Issuer; credentials: IssuedCredential[] }>(`/issuer/credentials?issuerId=${issuerId}`),
-  revokeCredential: (id: number, reason?: string) =>
-    post<{ message: string; alreadyRevoked: boolean }>(`/issuer/credentials/${id}/revoke`, { reason }),
+    expiresInDays?: number;
+  }) => post<{ credential: Credential; message: string; sdJwt: string }>('/issuer/credentials', input),
+  issuerCredentials: () => get<{ issuer: Issuer; credentials: IssuedCredential[] }>('/issuer/credentials'),
+  revokeCredential: (id: number) =>
+    post<{ message: string; alreadyRevoked: boolean }>(`/issuer/credentials/${id}/revoke`, {}),
 
-  // wallet
-  wallet: (citizenId: number) => get<WalletResponse>(`/wallet/credentials?citizenId=${citizenId}`),
-  consents: (citizenId: number) => get<{ citizen: Citizen; consents: Consent[] }>(`/wallet/consents?citizenId=${citizenId}`),
-  verifications: (citizenId: number) =>
-    get<CitizenVerifications>(`/wallet/verifications?citizenId=${citizenId}`),
+  // document verification flow (Flow B)
+  submitDocument: (input: {
+    documentType: string;
+    documentName: string;
+    documentRef: string;
+    mimeType?: string;
+    organizationId: number;
+    purpose: string;
+  }) => post<{ document: DocumentRequest; message: string }>('/wallet/documents', input),
+  myDocuments: () => get<{ documents: DocumentRequest[] }>('/wallet/documents'),
+  orgDocuments: (status?: string) =>
+    get<{ documents: DocumentRequest[] }>(
+      status ? `/organization/documents?status=${encodeURIComponent(status)}` : '/organization/documents',
+    ),
+  orgDocument: (id: number) =>
+    get<{ document: DocumentRequest; suggestedCredentialType: string }>(`/organization/documents/${id}`),
+  approveDocument: (id: number, input: { claims: Record<string, unknown>; expiresInDays?: number }) =>
+    post<{ document: DocumentRequest; credential: Credential; message: string }>(
+      `/organization/documents/${id}/approve`,
+      input,
+    ),
+  rejectDocument: (id: number, reason: string) =>
+    post<{ document: DocumentRequest; message: string }>(`/organization/documents/${id}/reject`, { reason }),
+
+  // wallet (identity from JWT; no citizenId query params)
+  wallet: () => get<WalletResponse>('/wallet/credentials'),
+  walletRequests: () => get<{ requests: PresentationRequest[] }>('/wallet/requests'),
+  approveRequest: (id: number, input: { credentialId: number; fields: string[] }) =>
+    post<ShareResult>(`/wallet/requests/${id}/approve`, input),
+  rejectRequest: (id: number) => post<{ consent: Consent }>(`/wallet/requests/${id}/reject`, {}),
+  consents: () => get<{ consents: Consent[] }>('/wallet/consents'),
+  verifications: () => get<CitizenVerifications>('/wallet/verifications'),
   share: (input: {
-    citizenId: number;
-    verifierId: number;
+    verifierId?: number;
+    organizationId?: number;
     credentialId: number;
     purpose: string;
     fields: string[];
     duration: string;
-  }) => post<ShareResult>('/wallet/presentations', input),
-  endConsent: (consentId: number) => post<{ message?: string; consent: Consent }>(`/wallet/consents/${consentId}/revoke`, {}),
+  }) => {
+    // Citizen-initiated share targets a legacy verifier id. When the UI picks
+    // an ORGANIZATION, resolve via organizations list is unnecessary: the
+    // backend linked-verifier shares the org DID, but /wallet/presentations
+    // still expects verifierId. For org targets we look up the linked verifier
+    // lazily is server-side concern — here we require verifierId. Org-aware
+    // shares go through the request/approve flow instead.
+    if (input.organizationId !== undefined && input.verifierId === undefined) {
+      throw new Error('Direct share needs a verifierId; use the request flow for organizations.');
+    }
+    return post<ShareResult>('/wallet/presentations', {
+      verifierId: input.verifierId,
+      credentialId: input.credentialId,
+      purpose: input.purpose,
+      fields: input.fields,
+      duration: input.duration,
+    });
+  },
+  endConsent: (consentId: number) =>
+    post<{ message?: string; consent: Consent }>(`/wallet/consents/${consentId}/revoke`, {}),
 
-  // verifier
-  verify: (input: { verifierId: number; consentId: number; presentation: string }) =>
-    post<VerifyResponse>('/verifier/verify', input),
+  // verifier (legacy) — presentation only, request resolved server-side
+  verify: (presentation: string) => post<VerifyResponse>('/verifier/verify', { presentation }),
   verifierProfile: () => get<VerifierProfile>('/verifier/profile'),
+  verifierRequests: () => get<{ requests: PresentationRequest[] }>('/verifier/requests'),
+  createVerifierRequest: (input: {
+    citizenId: number;
+    credentialType: string;
+    requestedFields: string[];
+    purpose: string;
+    ttlMinutes?: number;
+  }) => post<{ request: PresentationRequest; consent: Consent }>('/verifier/requests', input),
 
-  // revocation + audit
+  // organization as verifier (unified role)
+  createOrgRequest: (input: {
+    citizenId: number;
+    credentialType: string;
+    requestedFields: string[];
+    purpose: string;
+    ttlMinutes?: number;
+  }) => post<{ request: PresentationRequest; consent: Consent }>('/organization/requests', input),
+  orgRequests: () => get<{ organization: Organization; requests: PresentationRequest[] }>('/organization/requests'),
+  orgVerify: (presentation: string) => post<VerifyResponse>('/organization/verify', { presentation }),
+
+  // revocation + audit (role-scoped)
   statusList: (issuerId: number) => get<StatusList>(`/status-lists/${issuerId}`),
-  audit: (limit = 200) => get<AuditResponse>(`/audit?limit=${limit}`),
-  auditVerify: () => get<ChainStatus>('/audit/verify'),
+  walletAudit: (limit = 100) => get<AuditResponse>(`/wallet/audit?limit=${limit}`),
+  orgAudit: (limit = 100) => get<AuditResponse>(`/organization/audit?limit=${limit}`),
+  adminAudit: (limit = 100) => get<AuditResponse>(`/admin/audit?limit=${limit}`),
+  adminAuditVerify: () => get<ChainStatus>('/admin/audit/verify'),
+
+  // admin trust registry
+  adminIssuers: () => get<{ issuers: Issuer[] }>('/admin/issuers'),
+  adminCreateIssuer: (input: {
+    name: string;
+    domain: string;
+    email: string;
+    password: string;
+    orgType?: string;
+    canIssue?: boolean;
+    canVerify?: boolean;
+  }) => post<{ issuer: Issuer }>('/admin/issuers', input),
+  adminSetIssuerStatus: (id: number, status: string) =>
+    post<{ issuer: Issuer; unchanged: boolean }>(`/admin/issuers/${id}/status`, { status }),
 };

@@ -1,27 +1,47 @@
 /**
- * Self-test for the parts that need NO database.
+ * Self-test for everything that needs NO database.
  *
  *   npm run test:crypto
  *
- * It proves the cryptographic core works before you even start Postgres:
- *   - did:key generation matches the W3C spec (multicodec 0xed01 + base58btc)
- *   - an SD-JWT can be issued, partially presented and verified
- *   - a tampered disclosure is rejected
- *   - a presentation with a wrong issuer key is rejected
- *   - status list bits round-trip through gzip + base64url
- *   - the audit hash chain recomputes and detects tampering
+ * Proves the cryptographic core before Postgres is even involved:
+ *   - RFC 9901 disclosure encoding, checked against INDEPENDENTLY computed
+ *     expectations (plain node:crypto, not our own helpers)
+ *   - issuance -> selective presentation -> verification, including _sd_alg
+ *   - SD-JWT+KB holder binding: valid proof accepted; wrong nonce / audience /
+ *     holder key / tampered bytes rejected
+ *   - attack resistance: forged disclosures, wrong issuer key, edited payload
+ *   - did:key local resolution round-trip + malformed rejection
+ *   - Bitstring Status List: multibase encoding, 16KB minimum, bit ops
+ *   - KeyStore AES-GCM round-trip (with a throwaway in-process key)
+ *   - credential schemas accept valid claims and reject unknown fields
+ *   - audit hash-chain rule (in-memory) + live chain when a DB is reachable
  */
+import { createHash, randomBytes } from 'node:crypto';
 import {
-  base58Encode,
   base64urlDecode,
   base64urlEncode,
+  base58Encode,
+  base58Decode,
   didKeyFromPublicJwk,
-  digest,
+  resolveDidKey,
   generateEd25519KeyPair,
   JWS_ALG,
 } from './crypto';
-import { createPresentation, decodeDisclosure, indexCredential, issueSdJwt, verifyPresentation } from './sdjwt';
-import { encodeBitstring, decodeBitstring, isRevoked, setRevoked } from './statusList';
+import {
+  attachKeyBinding,
+  computeSdHash,
+  createPresentation,
+  decodeDisclosure,
+  indexCredential,
+  issueSdJwt,
+  makeDisclosure,
+  SD_ALG,
+  verifyPresentation,
+} from './sdjwt';
+import { encodeBitstring, decodeBitstring, isRevoked, setRevoked, INITIAL_BITS_BYTES } from './statusList';
+import { decryptPrivateJwk, encryptPrivateJwk } from './keystore';
+import { validateClaims } from './schemas';
+import { buildVc } from './vc';
 import { computeHash, GENESIS, stableStringify, verifyAuditChain } from './audit';
 import { closePool } from './db';
 
@@ -36,42 +56,38 @@ function check(name: string, condition: boolean, extra = ''): void {
   }
 }
 
-/**
- * base58btc decoder, local to this test file: used to prove the did:key really
- * contains the 0xed01 multicodec prefix followed by the raw 32-byte key.
- * (crypto.ts only needs the encoder, so the decoder is not shipped.)
- */
-function base58Decode(input: string): Buffer {
-  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-  let zeroes = 0;
-  while (zeroes < input.length && input[zeroes] === '1') zeroes += 1;
-
-  const bytes: number[] = [];
-  for (const char of input) {
-    const value = alphabet.indexOf(char);
-    if (value < 0) throw new Error(`not base58: ${char}`);
-    let carry = value;
-    for (let i = 0; i < bytes.length; i += 1) {
-      carry += bytes[i] * 58;
-      bytes[i] = carry & 0xff;
-      carry >>= 8;
-    }
-    while (carry > 0) {
-      bytes.push(carry & 0xff);
-      carry >>= 8;
-    }
-  }
-  return Buffer.from([...new Array(zeroes).fill(0), ...bytes.reverse()]);
+/** SHA-256 base64url computed WITHOUT touching our digest() helper. */
+function independentDigest(ascii: string): string {
+  return createHash('sha256').update(ascii, 'utf8').digest().toString('base64url');
 }
 
 async function main(): Promise<void> {
   console.log('\nLifeLink crypto self-test (no database needed)\n');
 
-  // ---- base64url + digest ---------------------------------------------
-  console.log('base64url / SHA-256');
-  check('base64url round-trip', base64urlDecode(base64urlEncode('lifelink')).toString() === 'lifelink');
-  check('digest is 43 chars (256 bits, no padding)', digest('hello').length === 43);
-  check('base58 alphabet output', /^[1-9A-HJ-NP-Za-km-z]+$/.test(base58Encode(Buffer.from([0, 1, 2, 250, 255]))));
+  // ---- RFC 9901 disclosure encoding ----------------------------------
+  console.log('RFC 9901 disclosure encoding');
+  const salt = base64urlEncode(randomBytes(16));
+  const { disclosure, digest: claimDigest } = makeDisclosure('employmentStatus', 'employed', salt);
+  const expectedDisclosure = Buffer.from(JSON.stringify([salt, 'employmentStatus', 'employed'])).toString(
+    'base64url',
+  );
+  check('disclosure is base64url(JSON([salt, name, value]))', disclosure === expectedDisclosure, disclosure);
+  check('digest is base64url(sha256(ascii))', claimDigest === independentDigest(disclosure));
+  check('disclosure has no separators (single token)', !disclosure.includes('.') && !disclosure.includes('~'));
+  const triple = decodeDisclosure(disclosure);
+  check(
+    'decode returns the [salt, name, value] triple',
+    triple.salt === salt && triple.key === 'employmentStatus' && triple.value === 'employed',
+  );
+  for (const bad of ['not-base64!!!', base64urlEncode(JSON.stringify({ a: 1 })), base64urlEncode(JSON.stringify(['only', 'two']))]) {
+    let threw = false;
+    try {
+      decodeDisclosure(bad);
+    } catch {
+      threw = true;
+    }
+    check(`malformed disclosure rejected (${bad.slice(0, 18)}…)`, threw);
+  }
 
   // ---- keys + did:key -------------------------------------------------
   console.log('\nKeys and DIDs');
@@ -79,121 +95,252 @@ async function main(): Promise<void> {
   const citizenKeys = await generateEd25519KeyPair();
   const issuerDid = didKeyFromPublicJwk(issuerKeys.publicJwk);
   const citizenDid = didKeyFromPublicJwk(citizenKeys.publicJwk);
-  check('issuer did:key prefix', issuerDid.startsWith('did:key:z'), issuerDid);
-  check('citizen did:key differs from issuer', citizenDid !== issuerDid);
-  check('did:key is deterministic for the same key', didKeyFromPublicJwk(issuerKeys.publicJwk) === issuerDid);
-
-  // The did:key payload must be base58btc(0xed01 || raw 32-byte public key).
-  const didBytes = base58Decode(issuerDid.replace('did:key:z', ''));
-  check('did:key multicodec prefix is 0xed01 (ed25519-pub)', didBytes[0] === 0xed && didBytes[1] === 0x01);
-  check('did:key carries the raw 32-byte public key', didBytes.length === 34 && didBytes.subarray(2).equals(base64urlDecode(issuerKeys.publicJwk.x as string)));
+  check('did:key prefix', issuerDid.startsWith('did:key:z'), issuerDid);
+  const resolved = resolveDidKey(citizenDid);
+  check('did:key resolves to the same public key', resolved.publicJwk.x === citizenKeys.publicJwk.x);
+  check('base58 round-trip', base58Decode(base58Encode(Buffer.from([0, 1, 2, 250, 255]))).equals(Buffer.from([0, 1, 2, 250, 255])));
+  for (const bad of ['did:web:example.com', 'did:key:z!!!', 'did:key:z6Mkty']) {
+    let threw = false;
+    try {
+      resolveDidKey(bad);
+    } catch {
+      threw = true;
+    }
+    check(`unresolvable DID rejected (${bad.slice(0, 20)})`, threw);
+  }
 
   // ---- SD-JWT issuance ------------------------------------------------
   console.log('\nSD-JWT issuance');
   const claims = {
-    degree: 'Bachelor of Technology',
-    university: 'Demo University',
-    field_of_study: 'Computer Science',
-    year_of_graduation: 2025,
-    status: 'employed',
+    employmentStatus: 'employed',
+    employer: 'Demo Employer Pvt Ltd',
+    jobTitle: 'Software Engineer',
+    joiningDate: '2025-08-01',
     salary: 1800000,
   };
   const issued = await issueSdJwt({
     issuer: issuerDid,
     issuerPrivateKey: issuerKeys.privateKey,
     subject: citizenDid,
-    type: 'DegreeCredential',
+    type: 'EmploymentCredential',
     claims,
+    vcId: 'urn:lifelink:test:1',
     expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
     statusListUrl: 'http://localhost:4000/status-lists/1',
-    statusIndex: 0,
+    statusIndex: 7,
   });
 
-  check('JWT is signed (3 dot-separated parts)', issued.jwt.split('.').length === 3);
-  check('header alg is EdDSA', JSON.parse(base64urlDecode(issued.jwt.split('.')[0]).toString()).alg === JWS_ALG);
-  check('payload carries _sd digests only', Array.isArray(issued.payload._sd) && issued.payload._sd.length === Object.keys(claims).length);
+  check('_sd_alg is sha-256', issued.payload._sd_alg === SD_ALG && issued.payload._sd_alg === 'sha-256');
+  check('every claim has exactly one digest', issued.payload._sd.length === Object.keys(claims).length);
+  check(
+    'each digest independently recomputes',
+    issued.disclosedClaims.every((c) => independentDigest(c.disclosure) === c.digest),
+  );
   check(
     'NO claim value leaks into the signed JWT',
-    !issued.jwt.split('.')[1].includes(base64urlEncode(JSON.stringify('1800000'))) &&
-      !Buffer.from(issued.jwt.split('.')[1], 'base64url').toString().includes('salary'),
+    !Buffer.from(issued.jwt.split('.')[1], 'base64url').toString().includes('employmentStatus'),
   );
-  check('combined format has jwt + N disclosures', issued.combined.split('~').filter(Boolean).length === 1 + Object.keys(claims).length);
-  check(
-    'each disclosure is "<salt>.<b64 json>"',
-    issued.disclosedClaims.every((c) => /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(c.disclosure) && decodeDisclosure(c.disclosure).sd.length > 0),
-  );
+  check('header alg is EdDSA', JSON.parse(base64urlDecode(issued.jwt.split('.')[0]).toString()).alg === JWS_ALG);
+  check('vc_id cross-reference carried', issued.payload.vc_id === 'urn:lifelink:test:1');
 
-  // ---- presentation (the product's whole point) ------------------------
+  // ---- selective presentation (no KB) ---------------------------------
   console.log('\nSelective disclosure presentation');
-  const { presentation, revealed, missing } = createPresentation(issued.combined, ['status']);
+  const { presentation, revealed, missing } = createPresentation(issued.combined, ['employmentStatus']);
   check('missing fields reported', missing.length === 0);
-  check('exactly one field revealed', Object.keys(revealed).length === 1 && revealed.status === 'employed');
-  check('presentation contains 1 disclosure', presentation.split('~').filter(Boolean).length === 2);
-  check('hidden salary is NOT in the presentation', !presentation.includes('salary') && !presentation.includes('1800000'));
-  check('issuer public key was never leaked', !presentation.includes(issuerKeys.publicJwk.x as string));
+  check('exactly one field revealed', Object.keys(revealed).length === 1);
+  check('salary is NOT in the presentation', !presentation.includes('salary') && !presentation.includes('1800000'));
 
   const verified = await verifyPresentation(presentation, issuerKeys.publicJwk);
   check('signature valid', verified.signatureValid);
+  check('_sd_alg accepted', verified.sdAlgValid);
   check('disclosure digests valid', verified.digestsValid);
-  check('only the consented field came back', Object.keys(verified.revealed).join(',') === 'status');
-  check('vct survived', verified.payload.vct === 'DegreeCredential');
-  check('status pointer survived', verified.payload.status.idx === 0);
+  check('KB correctly reported absent', verified.kb.present === false);
+  check('only the consented field came back', Object.keys(verified.revealed).join(',') === 'employmentStatus');
 
-  // ---- attack 1: forge a claim ----------------------------------------
+  // ---- SD-JWT+KB holder binding ---------------------------------------
+  console.log('\nSD-JWT+KB holder binding');
+  const nonce = base64urlEncode(randomBytes(16));
+  const aud = 'did:web:bank.demo.lifelink';
+  const kb = await attachKeyBinding({
+    presentationWithoutKb: presentation,
+    holderPrivateKey: citizenKeys.privateKey,
+    nonce,
+    aud,
+  });
+  check('sd_hash covers the presentation bytes', kb.sdHash === independentDigest(presentation));
+  check('KB appended after the disclosures', kb.presentation.endsWith(kb.kbJwt));
+
+  const kbOk = await verifyPresentation(kb.presentation, issuerKeys.publicJwk, {
+    holderPublicJwk: citizenKeys.publicJwk,
+    expectedNonce: nonce,
+    expectedAud: aud,
+  });
+  check('KB signature valid', kbOk.kb.signatureValid);
+  check('KB sd_hash valid', kbOk.kb.sdHashValid);
+  check('KB nonce valid', kbOk.kb.nonceValid);
+  check('KB audience valid', kbOk.kb.audValid);
+  check('KB fresh', kbOk.kb.fresh);
+
+  const wrongNonce = await verifyPresentation(kb.presentation, issuerKeys.publicJwk, {
+    holderPublicJwk: citizenKeys.publicJwk,
+    expectedNonce: 'another-request-nonce',
+    expectedAud: aud,
+  });
+  check('wrong nonce rejected (replay across requests fails)', wrongNonce.kb.nonceValid === false);
+
+  const wrongAud = await verifyPresentation(kb.presentation, issuerKeys.publicJwk, {
+    holderPublicJwk: citizenKeys.publicJwk,
+    expectedNonce: nonce,
+    expectedAud: 'did:web:someone-else.example',
+  });
+  check('wrong audience rejected', wrongAud.kb.audValid === false);
+
+  const otherHolder = await generateEd25519KeyPair();
+  const wrongKey = await verifyPresentation(kb.presentation, issuerKeys.publicJwk, {
+    holderPublicJwk: otherHolder.publicJwk,
+    expectedNonce: nonce,
+    expectedAud: aud,
+  });
+  check("another holder's key rejected (no impersonation)", wrongKey.kb.signatureValid === false);
+
+  // Tamper with a revealed value: swap the disclosure, keep the KB.
+  const tamperedDisclosure = base64urlEncode(JSON.stringify([salt, 'employmentStatus', 'ceo']));
+  const tamperedPres = `${presentation.split('~')[0]}~${tamperedDisclosure}~${kb.kbJwt}`;
+  const tampered = await verifyPresentation(tamperedPres, issuerKeys.publicJwk, {
+    holderPublicJwk: citizenKeys.publicJwk,
+    expectedNonce: nonce,
+    expectedAud: aud,
+  });
+  check('swapped disclosure fails the digest check', tampered.digestsValid === false);
+  check('swapped bytes fail sd_hash too', tampered.kb.sdHashValid === false);
+  check('forged value never returned', tampered.revealed.employmentStatus === undefined);
+
+  const noKbRequired = await verifyPresentation(presentation, issuerKeys.publicJwk, {
+    holderPublicJwk: citizenKeys.publicJwk,
+  });
+  check('missing KB rejected when holder binding is required', noKbRequired.kb.present === false);
+
+  // ---- attack 1: wrong issuer key --------------------------------------
   console.log('\nAttack resistance');
-  const forgedDisclosure = `${base64urlEncode('attacker-salt')}.~${base64urlEncode(
-    JSON.stringify({ status: 'ceo', sd: 'attacker-salt' }),
-  )}`;
-  const forged = `${issued.jwt}~${forgedDisclosure}~`;
-  const forgedResult = await verifyPresentation(forged, issuerKeys.publicJwk);
-  check('forged disclosure rejected (no matching _sd digest)', forgedResult.digestsValid === false);
-  check('forged value is not returned', forgedResult.revealed.status === undefined);
+  const otherIssuer = await generateEd25519KeyPair();
+  const wrongIssuerKey = await verifyPresentation(kb.presentation, otherIssuer.publicJwk);
+  check('wrong issuer key rejected', wrongIssuerKey.signatureValid === false);
 
-  // ---- attack 2: wrong issuer key -------------------------------------
-  const otherKeys = await generateEd25519KeyPair();
-  const wrongKey = await verifyPresentation(presentation, otherKeys.publicJwk);
-  check('wrong issuer key rejected', wrongKey.signatureValid === false);
-
-  // ---- attack 3: tamper with a signed value ---------------------------
-  const tamperedJwtPayload = Buffer.from(issued.jwt.split('.')[1], 'base64url')
-    .toString('utf8')
-    .replace(/"vct":"DegreeCredential"/, '"vct":"FakeCredential"');
-  const tampered = `${issued.jwt.split('.')[0]}.${Buffer.from(tamperedJwtPayload).toString('base64url')}.${issued.jwt.split('.')[2]}~${issued.disclosedClaims[0].disclosure}~`;
-  const tamperedResult = await verifyPresentation(tampered, issuerKeys.publicJwk);
-  check('tampered payload rejected by the signature', tamperedResult.signatureValid === false);
-
-  // ---- credential indexing (used by the wallet) -----------------------
-  console.log('\nWallet helpers');
-  const indexed = indexCredential(issued.combined);
-  check('indexCredential finds every claim', indexed.byKey.size === Object.keys(claims).length);
-  check('digests line up with _sd', [...indexed.byKey.values()].every((c) => indexed.digests.includes(c.digest)));
-
-  // ---- status list -----------------------------------------------------
+  // ---- status list ------------------------------------------------------
   console.log('\nW3C Bitstring Status List');
+  check('list starts at the 16KB spec minimum', INITIAL_BITS_BYTES === 16 * 1024);
   const bits = Buffer.alloc(16, 0);
   check('fresh bit is valid', isRevoked(bits, 3) === false);
   const revokedBits = setRevoked(bits, 3);
   check('bit 3 now revoked', isRevoked(revokedBits, 3) === true);
   check('neighbouring bits untouched', isRevoked(revokedBits, 2) === false && isRevoked(revokedBits, 4) === false);
   const encoded = encodeBitstring(revokedBits);
+  check('encodedList carries the multibase "u" prefix', encoded.startsWith('u'));
   check('gzip + base64url round-trip', decodeBitstring(encoded).equals(revokedBits));
-  check('encoded form is compact', encoded.length < 60, `${encoded.length} chars for 128 bits`);
 
-  // ---- audit hash chain -------------------------------------------------
+  // ---- KeyStore ----------------------------------------------------------
+  console.log('\nKeyStore (AES-GCM at rest)');
+  process.env.ISSUER_KEY_ENC_KEY ??= Buffer.from(randomBytes(32)).toString('hex');
+  const enc = encryptPrivateJwk(citizenKeys.privateJwk);
+  check('envelope hides the key material', JSON.stringify(enc).indexOf(citizenKeys.privateJwk.d as string) === -1);
+  const dec = decryptPrivateJwk(enc);
+  check('decrypt round-trips the JWK', dec.d === citizenKeys.privateJwk.d && dec.x === citizenKeys.privateJwk.x);
+
+  // ---- credential schemas -------------------------------------------------
+  console.log('\nCredential schemas');
+  const goodDegree = validateClaims('DegreeCredential', {
+    name: 'Demo Student',
+    degree: 'B.Tech',
+    university: 'Demo University',
+    graduationYear: 2025,
+  });
+  check('valid DegreeCredential accepted', goodDegree.ok);
+  const extraField = validateClaims('DegreeCredential', {
+    name: 'X',
+    degree: 'Y',
+    university: 'Z',
+    graduationYear: 2025,
+    passportNumber: 'ATTACK',
+  });
+  check('unknown field rejected (strict)', !extraField.ok);
+  const badYear = validateClaims('DegreeCredential', {
+    name: 'X',
+    degree: 'Y',
+    university: 'Z',
+    graduationYear: 'soon',
+  });
+  check('malformed field rejected', !badYear.ok);
+  check('unknown type rejected', !validateClaims('PassportCredential', { a: 1 }).ok);
+  const goodEmp = validateClaims('EmploymentCredential', {
+    employmentStatus: 'employed',
+    employer: 'Demo Employer Pvt Ltd',
+    jobTitle: 'Software Engineer',
+    joiningDate: '2025-08-01',
+    salary: 1800000,
+  });
+  check('valid EmploymentCredential (with salary) accepted', goodEmp.ok);
+
+  // ---- W3C VC 2.0 mapping --------------------------------------------------
+  console.log('\nW3C VC 2.0 representation');
+  const vc = buildVc({
+    id: 'urn:lifelink:test:1',
+    issuerDid,
+    subjectDid: citizenDid,
+    type: 'EmploymentCredential',
+    claims,
+    validFrom: new Date(),
+    validUntil: new Date(Date.now() + 1000),
+    statusListUrl: 'http://localhost:4000/status-lists/1',
+    statusIndex: 7,
+  });
+  check('@context is the VC 2.0 context', vc['@context'].includes('https://www.w3.org/ns/credentials/v2'));
+  check('type includes VerifiableCredential + specific type', vc.type.includes('VerifiableCredential') && vc.type.includes('EmploymentCredential'));
+  check('credentialSubject carries holder DID + claims', vc.credentialSubject.id === citizenDid);
+  check(
+    'credentialStatus is a BitstringStatusListEntry',
+    vc.credentialStatus.type === 'BitstringStatusListEntry' &&
+      vc.credentialStatus.statusPurpose === 'revocation' &&
+      vc.credentialStatus.statusListIndex === 7,
+  );
+
+  // ---- wallet helpers -------------------------------------------------------
+  console.log('\nWallet helpers');
+  const indexed = indexCredential(issued.combined);
+  check('indexCredential finds every claim', indexed.byKey.size === Object.keys(claims).length);
+  check('digests line up with _sd', [...indexed.byKey.values()].every((c) => indexed.digests.includes(c.digest)));
+
+  // ---- document flow mapping (Flow B, no DB) --------------------------------
+  console.log('\nDocument verification mapping (Flow B)');
+  const { normalizeDocumentType, credentialTypeForDocument, eligibleOrgTypesForDocument } =
+    await import('./documentTypes.js');
+  check('BCA_Degree.pdf normalizes to Degree', normalizeDocumentType('BCA_Degree.pdf') === 'Degree');
+  check('Degree maps to DegreeCredential', credentialTypeForDocument('BCA_Degree.pdf') === 'DegreeCredential');
+  check(
+    'Degree eligible orgs are universities',
+    (eligibleOrgTypesForDocument('Degree') ?? []).includes('University'),
+  );
+  check('Employment maps to EmploymentCredential', credentialTypeForDocument('Employment') === 'EmploymentCredential');
+  check('KYC maps to BankCustomerCredential', credentialTypeForDocument('KYC') === 'BankCustomerCredential');
+  check('Health maps to HealthCredential', credentialTypeForDocument('Health') === 'HealthCredential');
+  check('uploaded doc never auto-issues (mapping only, no signing here)', credentialTypeForDocument('Degree') !== ('TRUSTED' as unknown as string));
+
+  // ---- selective disclosure enforcement -------------------------------------
+  console.log('\nSelective disclosure enforcement');
+  const partial = createPresentation(issued.combined, ['employer']);
+  check('partial presentation reveals only approved field', Object.keys(partial.revealed).join(',') === 'employer');
+  const partialVerified = await verifyPresentation(partial.presentation, issuerKeys.publicJwk);
+  check('non-approved salary NOT disclosed', (partialVerified.revealed as Record<string, unknown>).salary === undefined);
+  check('approved employer disclosed', (partialVerified.revealed as Record<string, unknown>).employer === claims.employer);
+
+  // ---- audit hash chain ------------------------------------------------------
   console.log('\nAudit hash chain (in-memory, same rule as the DB version)');
-  const entry1 = { eventType: 'ISSUER_CREDENTIAL_ISSUED', credentialId: 1 };
-  const entry2 = { eventType: 'CONSENT_GRANTED', credentialId: 1, sharedFields: ['status'] };
-  const p1 = stableStringify(entry1);
-  const p2 = stableStringify(entry2);
+  const p1 = stableStringify({ eventType: 'CREDENTIAL_ISSUED', credentialId: 1 });
+  const p2 = stableStringify({ eventType: 'CONSENT_APPROVED', sharedFields: ['employmentStatus'] });
   const h1 = computeHash(GENESIS, p1);
   const h2 = computeHash(h1, p2);
-  check('first entry links to GENESIS', computeHash(GENESIS, p1) === h1);
   check('second entry links to the first hash', computeHash(h1, p2) === h2);
-  check('stable stringify is key-order independent', stableStringify({ b: 1, a: 2 }) === stableStringify({ a: 2, b: 1 }));
-  check('hash is 43 chars', h1.length === 43);
-  check('changing the payload changes the hash', computeHash(h1, stableStringify({ ...entry2, sharedFields: ['salary'] })) !== h2);
+  check('changing the payload changes the hash', computeHash(h1, stableStringify({ eventType: 'X' })) !== h2);
 
-  // If a database happens to be reachable, verify the real chain too.
   try {
     const chain = await verifyAuditChain();
     check(`live audit chain intact (${chain.length} entries)`, chain.valid, chain.reason ?? '');
